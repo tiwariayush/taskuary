@@ -17,7 +17,7 @@ import AttachFileIcon from "@mui/icons-material/AttachFile";
 import api from "./api";
 import AgentWall from "./AgentWall.jsx";
 import { NO_REPO, planTask } from "./newTask.js";
-import { pollWhileVisible } from "./visible.js";
+import { onLive } from "./live.js";
 import { ALERT, PANEL, PANEL2, BORDER, CATPPUCCIN, DIM, FAINT, INK, card, hoverable, mono } from "./theme.jsx";
 import { ChannelIcon, ActionChip, AgentPicker, useAgents, timeAgo, Empty, IDLE_WAITING, isWaiting, PromptThumbs, TellAgent, WorkPane, usePromptImages, TaskuaryMark } from "./ui.jsx";
 
@@ -265,13 +265,13 @@ export default function BoardView({ onOpenTask, onOpenReports }) {
     try { setTasks(((await api.get("/api/tasks", { params: { active: 1 } })).data.data || []).filter((t) => t.Status !== "dropped")); }
     catch (e) { setErr(e?.response?.data?.detail || "Failed to load the board"); }
   }, []);
-  useEffect(() => { load(); return pollWhileVisible(load, 15000); }, [load]);
-  // live tails poll fast (the cards are a status wall you watch); the task page has the full trace
+  useEffect(() => { load(); return onLive("task-changed", load); }, [load]);
+  // live tails arrive as run-tail (the cards are a status wall you watch); the task page has the full trace
   useEffect(() => {
     const tick = () => api.get("/api/runs/live").then(({ data }) =>
       setLive(Object.fromEntries((data.data || []).map((r) => [r.TaskId, r])))).catch(() => {});
     tick();
-    return pollWhileVisible(tick, 4000);
+    return onLive("run-tail", tick);
   }, []);
   useEffect(() => {
     if (agents.length && !agents.includes(nt.agent)) setNt((cur) => ({ ...cur, agent: agents[0] }));
