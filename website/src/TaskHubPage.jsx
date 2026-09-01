@@ -5,6 +5,7 @@ import { Badge, Box, Button, CircularProgress, IconButton, MenuItem, Popover, Se
 import NotificationsNoneIcon from "@mui/icons-material/NotificationsNone";
 import NotificationsActiveIcon from "@mui/icons-material/NotificationsActive";
 import { pollWhileVisible } from "./visible.js";
+import { holdLive } from "./live.js";
 import { ThemeProvider, CssBaseline } from "@mui/material";
 import RefreshIcon from "@mui/icons-material/Refresh";
 import api from "./api";
@@ -154,6 +155,7 @@ function ServerVersion() {
 export default function TaskHubPage() {
   const [tab, setTab] = useState("Timeline");
   const demo = useDemo();          // the badge, and what the header hides to make room for it
+  useEffect(() => holdLive(), []);
   const [selectedTask, setSelectedTask] = useState(null);
   const [pending, setPending] = useState(0);
   const [tick, setTick] = useState(0);
