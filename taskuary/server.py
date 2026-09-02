@@ -91,7 +91,9 @@ async def token_gate(request: Request, call_next):
     if tok and request.url.path.startswith('/api') and request.headers.get('X-Taskuary-Token') not in (tok, cfg['server'].get('agent_token')):
         # an <img src> cannot carry a header, so attachment READS take the token in the query
         # string - the same concession websockets already needed
-        if not (request.url.path.startswith('/api/attachments/') and request.query_params.get('token') == tok):
+        # ...and an OAuth callback is a redirect from the provider's site: no header can ride on it.
+        # It proves itself with the one-time state it was issued (quickbooks_authorize), not the token.
+        if not (request.url.path.startswith('/api/attachments/') and request.query_params.get('token') == tok)                 and request.url.path != '/api/quickbooks/callback':
             return HTMLResponse('unauthorized', status_code=401)
     # WHAT AN AGENT MAY NOT DO, before a handler exists to be talked round (guard.py). A session
     # runs with the agent token in its environment, and the routes that SEND - approve a reply,
@@ -274,6 +276,15 @@ def assistant_state(task_id: int):
 def assistant_session(task_id: int, body: AssistantSessionBody = None):
     from . import general
     body = body or AssistantSessionBody()
+    # Opening a FINISHED chat must not resurrect it. GeneralWorkspace posts here on mount, so
+    # merely LOOKING at a closed conversation started a live session; it parked with nothing to
+    # answer, and BoardView.laneOf - which reads a session that began after ClosedAt as "somebody
+    # picked this back up" - filed a done task under Waiting on you, where TQ-0291 sat for
+    # forty-five minutes. Reading a closed conversation is reading, not resuming. Sending a
+    # message still starts one, because that IS picking it back up.
+    t = store.get_task(task_id) or {}
+    if t.get('Status') in ('done', 'dropped') and not general.session_for(task_id):
+        return _assistant_payload(task_id)
     try: session = general.start_session(store, task_id, body.connector_id, body.model, ACTOR, body.pick)
     except (ValueError, RuntimeError) as e: raise HTTPException(422, str(e))
     return _assistant_payload(task_id, session)
@@ -761,7 +772,10 @@ def message_thread(mid: int, limit: int = 40):
     m = store.get_message(mid)
     if not m: raise HTTPException(404, 'message not found')
     msgs = store.thread_messages(m.get('ConversationId'), m.get('Subject'), limit)
-    return {'messages': msgs or [m], 'conversationId': m.get('ConversationId') or ''}
+    # ...and what was DECIDED about it. A row with no task has no task detail to read a
+    # history out of, and "not ours" is precisely the verdict that leaves it without one.
+    return {'messages': msgs or [m], 'conversationId': m.get('ConversationId') or '',
+            'routes': store.message_routes(mid)}
 
 @app.get('/api/messages/{mid}/attachments')
 def message_attachments(mid: int):
@@ -1125,15 +1139,27 @@ def handoff(task_id: int, body: HandoffBody):
     try:
         text = (body.text or '').strip() or outbound.draft_handoff(store, task_id, body.to or 'a colleague', body.note)
         if body.draft_only: return {'draft': text}
-        if not body.to: raise HTTPException(422, 'who is it going to?')
-        if body.channel == 'email':
-            sent = outbound.send_email(store, [body.to], f"{task_ref(task_id)} {t.get('Title') or ''}".strip(), text)
-        elif body.channel == 'teams':
-            msgs = [m for m in store.list_messages(task_id) if m['Channel'] == 'teams']
-            if not msgs: raise HTTPException(422, 'this task did not come from a chat, so there is no chat to post in - use email')
-            sent = outbound.send_teams(store, (msgs[-1].get('ConversationId') or '')[6:], text)
+        subject = f"{task_ref(task_id)} {t.get('Title') or ''}".strip()
+        chat = [m for m in store.list_messages(task_id) if m['Channel'] == 'teams'] if body.channel == 'teams' else []
+        if chat:
+            # back into the conversation this task CAME from: no address to give, because the
+            # thread is the recipient. (The old code demanded one anyway and then ignored it.)
+            sent = outbound.send_teams(store, (chat[-1].get('ConversationId') or '')[6:], text)
+        elif not body.to:
+            raise HTTPException(422, 'who is it going to?')
+        elif body.channel == 'email':
+            sent = outbound.send_email(store, [body.to], subject, text)
         else:
-            raise HTTPException(422, f'cannot send on {body.channel}')
+            # ...and everywhere else this install can send. Handing work to a person was email or
+            # the task's own Teams chat and nothing else, while the app has been able to send on
+            # WhatsApp, Slack and Telegram for months - so "hand this to a colleague" meant opening
+            # WhatsApp yourself, which is the app this one exists to keep you out of. send_out is
+            # the same road a report's delivery takes: same senders, same credentials, and a
+            # channel switched off for replies is off for this too.
+            if not outbound.can_reply(store, body.channel):
+                raise HTTPException(422, f'{body.channel} cannot send from here - turn its replies '
+                                         'on in Connections, or pick another channel')
+            sent = outbound.send_out(store, body.channel, body.to, subject, text)
     except HTTPException: raise
     except Exception as e: raise HTTPException(422, str(e)[:400])
     store.add_comment(task_id, ACTOR, 'human', f'Handed off to {body.to} by {body.channel}:\n{text}')
@@ -1214,7 +1240,8 @@ def task_work(tid: int, diff: bool = True):
     if not t: raise HTTPException(404, 'task not found')
     from . import proof
     sess = hub_term.session_for(tid)
-    work = sess.witness.snapshot(sess.files(), sess.cwd, (sess.tail(1) or [''])[-1]) if sess else None
+    wit = getattr(sess, 'witness', None)             # a demo replay has none
+    work = wit.snapshot(sess.files(), sess.cwd, (sess.tail(1) or [''])[-1]) if wit else None
     rev = {}
     if diff:
         try: rev = proof.review(store, tid) or {}
@@ -1248,17 +1275,20 @@ class LoreBody(BaseModel):
 class LoreCommentBody(BaseModel): body: str
 
 @app.get('/api/handbook')
-def handbook_list(topic: str = None, q: str = None, sort: str = 'new', limit: int = 60):
+def handbook_list(topic: str = None, q: str = None, sort: str = 'new', limit: int = 60, status: str = 'live'):
     """The Social tab. Topics down the side, posts in the middle - the company's own know-how,
-    written by whichever agent worked it out, and correctable by whoever knows better."""
-    posts = store.lore_posts(topic or None, q or None, min(limit, 200), sort)
+    written by whichever agent worked it out, and correctable by whoever knows better.
+    status=removed lists what the vote or the owner took off - readable, restorable."""
+    posts = store.lore_posts(topic or None, q or None, min(limit, 200), sort, 'live' if status == 'live' else 'removed')
+    # the owner's own vote rides on each row so the arrow can show which way they leaned
+    for p in posts: p['MyVote'] = next((v['Delta'] for v in store.lore_votes(p['LoreId']) if v['Actor'] == ACTOR), 0)
     return {'topics': store.lore_topics(), 'data': posts, 'count': store.lore_count()}
 
 @app.get('/api/handbook/{lid}')
 def handbook_one(lid: int):
     p = store.lore_get(lid)
     if not p: raise HTTPException(404, 'no such entry')
-    return {**p, 'comments': store.lore_comments(lid)}
+    return {**p, 'comments': store.lore_comments(lid), 'votes': store.lore_votes(lid)}
 
 @app.post('/api/handbook')
 def handbook_post(body: LoreBody, request: Request):
@@ -1283,6 +1313,13 @@ def handbook_post(body: LoreBody, request: Request):
     try: return handbook.post(store, body.title, body.body, body.topic, body.kind, body.author or ACTOR)
     except ValueError as e: raise HTTPException(422, str(e))
 
+@app.post('/api/handbook/{lid}/restore')
+def handbook_restore(lid: int):
+    """Back on Social - a removed entry that turned out to be right after all."""
+    if not store.lore_get(lid): raise HTTPException(404, 'no such entry')
+    store.lore_restore(lid); store.audit('lore', lid, 'restore', ACTOR)
+    return dict(store.lore_get(lid))
+
 @app.post('/api/handbook/{lid}/comment')
 def handbook_comment(lid: int, body: LoreCommentBody):
     """A comment is how a post gets corrected without being erased. An agent that finds an entry
@@ -1294,12 +1331,13 @@ def handbook_comment(lid: int, body: LoreCommentBody):
     return {'commentId': cid, 'comments': store.lore_comments(lid)}
 
 @app.post('/api/handbook/{lid}/vote')
-def handbook_vote(lid: int, up: bool = True):
-    """Useful, or not. The score is what `handbook.block` ranks by, so voting is how the entries
-    an agent is handed before it starts become the ones that actually helped."""
-    if not store.lore_get(lid): raise HTTPException(404, 'no such entry')
-    store.lore_vote(lid, 1 if up else -1)
-    return dict(store.lore_get(lid))
+def handbook_vote(lid: int, up: bool = True, by: str = None):
+    """Up or down, one vote per voter - forum rules. The score ranks what `handbook.block` hands
+    an agent, and an entry voted below zero is removed from Social (restorable). `by` names an
+    agent voting through the API; the owner's own votes are ACTOR."""
+    from . import handbook
+    try: return handbook.vote(store, lid, 1 if up else -1, (by or ACTOR)[:60])
+    except ValueError as e: raise HTTPException(404, str(e))
 
 @app.post('/api/handbook/{lid}/retire')
 def handbook_retire(lid: int):
@@ -1871,6 +1909,8 @@ def wa_status(cid: int):
     from . import wabridge
     c = store.get_connector(cid, with_secret=True)
     if not c or c['Type'] != 'whatsapp': raise HTTPException(404, 'not a WhatsApp connector')
+    from . import demo
+    if demo.enabled(): return {'connected': False, 'bridge': False, 'node': False, 'manager': {}, 'detail': 'the demo has no bridge - nothing real is reachable from here'}
     # node: the one thing the card cannot install for the owner - step 1 of the pairing box turns on it
     try: return {**_status(c), 'bridge': True, 'node': True, 'manager': wabridge.state()}
     except RuntimeError as e: return {'connected': False, 'bridge': False, 'node': bool(wabridge.node()), 'detail': str(e), 'manager': wabridge.state()}   # bridge down is a state, not a 500
@@ -2069,6 +2109,78 @@ def report_compose(body: dict):
                                                            'confidence': out.get('confidence')})
     return out
 
+# ── QuickBooks Online (quickbooks.py): OAuth against Intuit, with a redirect back to this server ──
+@app.get('/api/connectors/{cid}/quickbooks/status')
+def quickbooks_status(cid: int):
+    """What the card needs to draw its Connect box: the redirect URI the Intuit app must carry,
+    whether a token is on the card, and which company it is for."""
+    from . import quickbooks as qb
+    c = store.get_connector(cid, with_secret=True)
+    if not c or c['Type'] != 'quickbooks': raise HTTPException(404, 'not a QuickBooks connector')
+    conf = json.loads(c.get('ConfigJson') or '{}')
+    return {'redirect_uri': qb.redirect_uri(cfg['server']), 'connected': bool(c.get('Secret')),
+            'realm_id': conf.get('realm_id') or '', 'env': conf.get('env') or 'production', 'has_app': bool(conf.get('client_id') and conf.get('client_secret'))}
+
+@app.get('/api/connectors/{cid}/quickbooks/authorize')
+def quickbooks_authorize(cid: int):
+    """Where the browser goes to say yes. The state carries the connector id back."""
+    from . import quickbooks as qb
+    c = store.get_connector(cid)
+    if not c or c['Type'] != 'quickbooks': raise HTTPException(404, 'not a QuickBooks connector')
+    nonce = secrets.token_urlsafe(16); _QB_STATES[cid] = (nonce, time.time())
+    try: return {'url': qb.authorize_url(json.loads(c.get('ConfigJson') or '{}'), qb.redirect_uri(cfg['server']), f'tq-{cid}-{nonce}')}
+    except qb.QuickBooksError as e: raise HTTPException(409, str(e))
+
+_QB_STATES = {}      # connector id -> (nonce, issued at): a callback must answer a Connect we actually started
+
+@app.get('/api/quickbooks/callback', response_class=HTMLResponse)
+def quickbooks_callback(code: str = None, state: str = '', realmId: str = None, error: str = None):
+    """Intuit sends the browser back here with the code and the company id. The exchange happens
+    server-side and the refresh token never reaches the page; the tab just says it worked."""
+    from . import quickbooks as qb
+    page = lambda msg, ok=True: f'<!doctype html><meta charset=utf-8><title>Taskuary</title><body style="font:15px system-ui;padding:40px;color:#262521;background:#f6f4f1">' \
+                                f'<p style="font-weight:700">{"Connected" if ok else "Not connected"}</p><p>{msg}</p><p style="color:#6e685f">You can close this tab and go back to Taskuary.</p>'
+    if error: return page(f'Intuit said: {error}', False)
+    if not (code and state.startswith('tq-') and realmId): return page('the callback came back without a code or a company id', False)
+    try: cid, nonce = int(state.split('-')[1]), state.split('-', 2)[2]
+    except (ValueError, IndexError): return page('bad state', False)
+    issued = _QB_STATES.pop(cid, None)
+    if not issued or issued[0] != nonce or time.time() - issued[1] > 900: return page('this Connect link is not one Taskuary issued in the last 15 minutes - press Connect on the card again', False)
+    c = store.get_connector(cid, with_secret=True)
+    if not c or c['Type'] != 'quickbooks': return page('no such QuickBooks card', False)
+    try:
+        conf = qb.connection(store, cid)
+        qb.exchange_code(conf, code, qb.redirect_uri(cfg['server']), realmId)
+        store.save_connector({'ConnectorId': cid, 'Active': True}, ACTOR)
+        store.audit('connector', cid, 'quickbooks_connected', ACTOR, detail={'realm_id': realmId})
+    except Exception as e: return page(str(e)[:300], False)
+    return page(f'QuickBooks company {realmId} is connected to the {c["Name"]} card. Press Test there to read the company name.')
+
+# ── Teller (teller.py): the card runs Teller Connect in the browser; the token it hands back lands here ──
+class TellerEnrollBody(BaseModel): access_token: str; enrollment_id: str | None = None; institution: str | None = None
+
+@app.get('/api/connectors/{cid}/teller/status')
+def teller_status(cid: int):
+    from .teller import CONNECT_JS
+    c = store.get_connector(cid, with_secret=True)
+    if not c or c['Type'] != 'teller': raise HTTPException(404, 'not a Teller connector')
+    conf = json.loads(c.get('ConfigJson') or '{}')
+    return {'has_app': bool(conf.get('application_id')), 'connected': bool(c.get('Secret')), 'environment': conf.get('environment') or 'sandbox',
+            'institution': conf.get('institution') or '', 'application_id': conf.get('application_id') or '', 'connect_js': CONNECT_JS}
+
+@app.post('/api/connectors/{cid}/teller/enroll')
+def teller_enroll(cid: int, body: TellerEnrollBody):
+    """Teller Connect finished in the owner's browser: keep the access token (write-only) and name the
+    bank on the card. The token never shows again; Test proves it works."""
+    c = store.get_connector(cid)
+    if not c or c['Type'] != 'teller': raise HTTPException(404, 'not a Teller connector')
+    if not body.access_token.strip(): raise HTTPException(422, 'no access token in the enrolment')
+    conf = json.loads(c.get('ConfigJson') or '{}')
+    conf.update({k: v for k, v in (('enrollment_id', body.enrollment_id), ('institution', body.institution)) if v})
+    store.save_connector({'ConnectorId': cid, 'Secret': body.access_token.strip(), 'ConfigJson': json.dumps(conf), 'Active': True}, ACTOR)
+    store.audit('connector', cid, 'teller_enrolled', ACTOR, detail={'institution': body.institution or ''})
+    return {'ok': True}
+
 @app.get('/api/intacct/fields')
 def intacct_object_fields(obj: str, connector_id: int = None):
     """What this company's copy of an Intacct object actually carries, custom fields and all.
@@ -2251,14 +2363,37 @@ def delete_agent(name: str):
     store.audit('agent', 0, 'delete', ACTOR, detail=name)
     return {'ok': True}
 
+def _template_text(name: str) -> str:
+    try: return (Path(__file__).parent / 'templates' / f'{name}.md').read_text(encoding='utf-8')
+    except OSError: return ''
+
+def _heal_blank_doc(name: str) -> str:
+    """An EMPTY operator document is never what anyone meant: it switches off the rules every prompt
+    is stacked on (CODER.md blank = a coder with no rules) and it says nothing an owner wrote. The
+    templates have always said "blank the document entirely and the shipped default is used again",
+    so that is what happens - here, the moment it is read, not at the next restart."""
+    cur = store.get_doc(name)
+    if cur is not None and not str(cur).strip():
+        t = _template_text(name)
+        if t.strip():
+            store.save_doc(name, t, 'template'); store.audit('doc', 0, 'restored_blank', 'system', detail={'doc': name})
+            logger.warning(f'{name}.md was empty - the shipped default is back in place')
+            return t
+    return cur or ''
+
 @app.get('/api/doc/{name}')
 def get_doc(name: str):
     """Raw for the editor, rendered so you can see what an agent will actually read."""
-    return {'name': name, 'content': store.get_doc(name) or '', 'rendered': store.doc(name) or '',
+    content = _heal_blank_doc(name)
+    return {'name': name, 'content': content, 'rendered': store.doc(name) or '',
             'owner': store.owner()}
 
 @app.put('/api/doc/{name}')
 def put_doc(name: str, body: DocBody):
+    # blank = "give me the shipped default back", as the templates' own comments promise
+    if not str(body.content or '').strip() and _template_text(name).strip():
+        store.save_doc(name, _template_text(name), 'template')
+        return {'ok': True, 'restored': True}
     store.save_doc(name, body.content, ACTOR)
     return {'ok': True}
 
@@ -3009,12 +3144,16 @@ def build():
     a bug that was already fixed, and the owner has no way to tell the difference from inside
     the page. So the page asks, and says "reload" when the answer stops matching what it loaded.
     """
+    # `version` is the process; `disk_version` is pyproject.toml right now. They part company the
+    # moment a pull bumps the number under a running server - and until the owner restarts, the
+    # header pill, /api/version and the CLI banner all report the old one. The page says so.
+    from . import _version
     try:
         html = (_web_root / 'index.html').read_text(encoding='utf-8')
         return {'asset': (re.search(r'assets/(index-[A-Za-z0-9_-]+\.js)', html) or [None, ''])[1],
-                'version': _ver}
+                'version': _ver, 'disk_version': _version()}
     except OSError:
-        return {'asset': '', 'version': _ver}
+        return {'asset': '', 'version': _ver, 'disk_version': _version()}
 
 @app.get('/api/settings')
 def settings():

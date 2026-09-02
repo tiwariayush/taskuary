@@ -33,6 +33,15 @@ import json, re, threading, time
 from loguru import logger
 
 SETTING = 'agent_self_close'      # '1' (default) auto, 'ask' explicit-only, '0' off
+# A task the owner opened to WORK IN, rather than to have worked FOR them. Set when they start a
+# coding session from + New with "leave it open" ticked (website/src/newTask.js), and never by the
+# router - a message that arrived has somebody waiting on an answer, so finishing it should close
+# it and draft the reply, which is the whole point of the funnel.
+#
+# deliberately NOT checked in blocked(): declare() calls that, and `taskuary --done` must still
+# close a stay-open task. The agent SAYING it is finished outranks the tag; only the JUDGE - which
+# guesses from a screen that has gone quiet - is refused.
+STAY_TAG = 'stay:open'
 MIN_AGE = 45.0                    # seconds a session must have lived before it may close itself
 MIN_CHARS = 400                   # ...and printed. A session that produced nothing did nothing.
 JUDGE_TAIL = 6000                 # how much of the end of the transcript the judge reads
@@ -115,6 +124,16 @@ def blocked(store, tid: int, term=None) -> str:
     return ''
 
 
+def stays_open(store, tid: int) -> bool:
+    """Did the owner open this one to sit in? Then the judge does not get to end it.
+
+    A session started from the Board or + New is a place the owner is working - they alt-tab, the
+    agent goes quiet for forty-five seconds, the judge reads the last screen as 'finished' and the
+    task closes with a reply drafted to nobody. The tag says: only an explicit ending counts."""
+    tags = str((store.get_task(tid) or {}).get('Tags') or '')
+    return STAY_TAG in [t.strip() for t in tags.replace(',', ' ').split()]
+
+
 def _mark(tid: int) -> bool:
     """True the first time only - two hooks firing in the same second must not both wrap."""
     with _LOCK:
@@ -139,8 +158,17 @@ def declare(store, tid: int, summary: str = '', agent: str = 'agent') -> dict:
     why = blocked(store, tid, term.session_for(tid))
     # an explicit declaration outranks "it looks like a question": the agent just said otherwise
     if why and 'question' not in why: return {'closed': False, 'why': why}
-    if not _mark(tid): return {'closed': False, 'why': 'a self-close already ran for this task'}
     line = ' '.join(str(summary or '').split())[:1200]
+    # A session the owner opened to SIT IN is theirs to end. `--done` used to close it anyway -
+    # "either way", the box said - and TQ-0297 (2026-09-01) closed under the owner mid-review
+    # because the agent decided it was finished. The agent's verdict is filed where the owner
+    # reads it; the session stays at its prompt, which raises its hand; the owner presses Done.
+    if stays_open(store, tid):
+        store.add_comment(tid, agent, 'agent', f'The agent says it is finished: {line}' if line else 'The agent says it is finished.')
+        store.audit('task', tid, 'agent_done_held', agent, detail={'why': 'opened to work in'})
+        return {'closed': False, 'held': True,
+                'why': 'the owner opened this session to work in, so only they end it - your summary is on the task; stay at the prompt'}
+    if not _mark(tid): return {'closed': False, 'why': 'a self-close already ran for this task'}
     store.add_comment(tid, agent, 'agent',
                       f'The agent closed this itself: {line}' if line else 'The agent closed this itself.')
     return _wrap(store, tid, agent, 'the agent said it was finished' + (f' - {line}' if line else ''))
@@ -153,6 +181,9 @@ def on_stop(store, term, said: str = '') -> dict:
     if not tid or mode(store) != 'auto': return {'closed': False, 'why': 'not automatic'}
     why = blocked(store, tid, term)
     if why: return {'closed': False, 'why': why}
+    if stays_open(store, tid):
+        logger.debug(f'self-close: task {tid} was opened to work in - only `taskuary --done` ends it')
+        return {'closed': False, 'why': 'you opened this one to work in'}
     from . import terminal as _t
     v = judge(store, _t.harvest(term), said)
     if v['state'] != 'finished':

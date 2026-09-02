@@ -4,11 +4,12 @@
 // socket pushes new rows in; the list is not on a timer.
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
-  Alert, Box, Button, Chip, CircularProgress, Drawer, IconButton, ListSubheader, MenuItem, Select, TextField, Typography,
+  Alert, Box, Button, Chip, CircularProgress, Drawer, IconButton, ListSubheader, MenuItem, Select, TextField, Typography, useMediaQuery,
 } from "@mui/material";
 import CloseIcon from "@mui/icons-material/Close";
 import ChevronRightIcon from "@mui/icons-material/ChevronRight";
 import CallSplitIcon from "@mui/icons-material/CallSplit";
+import CheckIcon from "@mui/icons-material/Check";
 import ForumOutlinedIcon from "@mui/icons-material/ForumOutlined";
 import AttachFileIcon from "@mui/icons-material/AttachFile";
 import ForwardToInboxIcon from "@mui/icons-material/ForwardToInbox";
@@ -21,6 +22,7 @@ import { fadeBand } from "./timelineFade.js";
 import { availablePickerChannels, channelsForCategory } from "./feedFilters.js";
 import { timelineDayLabel } from "./timelineDay.js";
 import { splitTimelineMeetings } from "./timelineMeetings.js";
+import { groupThreads, loudest, spanText } from "./threadGroups.js";
 import EventIcon from "@mui/icons-material/Event";
 import { onLive } from "./live.js";
 import { feedHeaders, feedOk, takeFeed } from "./feedLoad.js";
@@ -29,12 +31,12 @@ import SyncIcon from "@mui/icons-material/Sync";
 import { Handoff } from "./Handoff.jsx";
 import { Reshape } from "./Reshape.jsx";
 import { Attachments } from "./Attachments.jsx";
-import { AgentPicker, ChannelIcon, RefChip, ChoiceRow, CoderReport, DiffBlock, Empty, FilterPills, ProofCard, SendToAgent, NotMine, fmtTime12, fmtDateTime, localDay, tsMs, cleanText, splitQuoted, IDLE_WAITING, TellAgentButton, LiveConsole, useAgents, useVoiceReady, TaskuaryMark } from "./ui.jsx";
+import { AgentPicker, ChannelIcon, RefChip, ChoiceRow, CoderReport, Confirm, DiffBlock, Empty, FilterPills, ProofCard, SendToAgent, NotMine, fmtTime12, fmtDateTime, localDay, tsMs, cleanText, splitQuoted, IDLE_WAITING, TellAgentButton, LiveConsole, useAgents, useVoiceReady, TaskuaryMark } from "./ui.jsx";
 import MicIcon from "@mui/icons-material/Mic";
 import MicOffIcon from "@mui/icons-material/MicOff";
 import { Md, looksMd } from "./md.jsx";
 import { subjectOf, sourceOf } from "./feedText.js";
-import { HOLD_TAG, hasTag, stateOf, subline } from "./timelineState.js";
+import { HOLD_TAG, hasTag, stateMeta, stateOf, subline } from "./timelineState.js";
 import StateMark, { edgeOf } from "./StateMark.jsx";
 import NewSheet from "./NewSheet.jsx";
 import AddIcon from "@mui/icons-material/Add";
@@ -43,21 +45,35 @@ import { TerminalPreview } from "./TerminalView.jsx";
 
 const GeneralWorkspace = React.lazy(() => import("./GeneralWorkspace.jsx").then((m) => ({ default: m.GeneralWorkspace })));
 
-// Each filter carries a muted hue for its selected state: attention amber for needs-me,
-// Outlook blue, Teams purple, quiet indigo for everything.
-// Two different dimensions, two controls: WHAT STATE it's in (everything vs needs me)
-// and WHICH CHANNEL it came from - they combine (e.g. "needs me" + "email").
-// STATE dimension, so these do get semantic colour - "needs me" is the one filter on this
-// screen that names something being on you.
+// Two different dimensions, two controls: WHAT STATE it's in (everything vs needs me) and WHICH
+// KIND / SOURCE it came from - they combine (e.g. "needs me" + "email"). STATE gets semantic
+// colour: "needs me" is the one filter on this screen that names something being on you.
 const VIEW_FILTERS = [
   { key: "", label: "everything", c: PILL_COLORS.pick },
   { key: "pending", label: "needs me", c: PILL_COLORS.you },
 ];
+// ...and on a PHONE the segmented control becomes one toggle pill with its count: the housing
+// scrolled there so only "everythin" showed, and the row had no room for two words twice (the
+// owner, 2026-09-01). The desktop keeps the segmented control exactly as it was.
+const NeedsMe = ({ on, n, onClick }) => (
+  <Box onClick={onClick} role="switch" aria-checked={on} title={on ? "showing only what is waiting on you — click for everything" : "show only what is waiting on you"}
+    sx={{ display: "inline-flex", alignItems: "center", gap: 0.65, height: 34, px: 1.35, borderRadius: 2, cursor: "pointer",
+      fontSize: 11.5, fontWeight: 700, whiteSpace: "nowrap", userSelect: "none", transition: "all .15s",
+      bgcolor: on ? PILL_COLORS.you.bg : PANEL2, color: on ? PILL_COLORS.you.fg : DIM,
+      border: `1px solid ${on ? PILL_COLORS.you.bd : BORDER}`,
+      "&:hover": { color: on ? PILL_COLORS.you.fg : INK, borderColor: on ? PILL_COLORS.you.bd : "#d8cfbe" } }}>
+    needs me
+    {n > 0 && (
+      <Box component="span" sx={{ px: 0.6, py: 0.05, borderRadius: 99, fontSize: 10, fontWeight: 700, lineHeight: 1.5,
+        fontVariantNumeric: "tabular-nums", bgcolor: on ? "rgba(255,255,255,.7)" : ALERT, color: on ? PILL_COLORS.you.fg : "#fffdfb" }}>{n}</Box>
+    )}
+  </Box>
+);
 // The pill row is a fixed set of CATEGORIES - it must not grow as connections do (a
 // pill per mailbox, repo, channel and report would be unreadable by connection five).
 // Everything narrower lives in one grouped picker: category -> channel -> connection.
 const CATEGORIES = [
-  { key: "", label: "everything", c: PILL_COLORS.pick },
+  { key: "", label: "all kinds", c: PILL_COLORS.pick },
   { key: "email", label: "email", c: PILL_COLORS.pick },
   { key: "messages", label: "messages", c: PILL_COLORS.pick },
   { key: "code", label: "code", c: PILL_COLORS.pick },
@@ -66,7 +82,7 @@ const CATEGORIES = [
 ];
 const CHANNEL_LABELS = { email: "Mailboxes", teams: "Teams chats", slack: "Slack channels",
   telegram: "Telegram chats", whatsapp: "WhatsApp chats", imessage: "Apple Messages chats", discord: "Discord channels",
-  github: "Repositories", gitlab: "GitLab instances", report: "Reports", assistant: "Assistant",
+  github: "Repositories", gitlab: "GitLab instances", report: "Reports", assistant: "Assistant posts", own: "Your own notes",
   jira: "Jira issues", asana: "Asana tasks", monday: "Monday items", linear: "Linear issues",
   clickup: "ClickUp tasks", todoist: "Todoist tasks",
   trello: "Trello cards", notion: "Notion pages", azdo: "Azure DevOps items",
@@ -124,6 +140,13 @@ const dotOf = (r) => (needsYou(r) || r.ReviewStatus === "pending" ? ACCENT
     : r.ReviewStatus === "auto" || r.TaskStatus === "done" ? "#b8b2a9"
       : r.TaskId ? ACCENT2 : "#a7b0a8");
 
+// How much each state DEMANDS of you, most first - which is what a fold has to sort by to pick
+// the face it wears. Deliberately NOT stateOf's evaluation order: that reads withdrawn first,
+// because a message that no longer exists cannot be what you act on, and for one row that is
+// right. For a fold it is backwards - a withdrawn line must never speak for four others, one of
+// which is a reply waiting on you.
+const LOUDNESS = ["reply", "waving", "working", "held", "answered", "todo", "mine", "done", "withdrawn", "fyi"];
+
 const PAGE = 100;
 
 // The funnel bar (rank mode): what is being worked and what waits, in value order. One line
@@ -144,14 +167,14 @@ const FunnelBar = ({ onOpenTask }) => {
           In the funnel {f.working.length}/{f.width}
         </Typography>
         <Box sx={{ width: "1px", height: 14, bgcolor: BORDER }} />
-        <Typography variant="caption" sx={{ fontWeight: 700, color: "#5b5f97", fontSize: 11 }}>
+        <Typography variant="caption" sx={{ fontWeight: 700, color: ROLES.working.ink, fontSize: 11 }}>
           Next up {f.queued.length} {open ? "▾" : "▸"}
         </Typography>
         <Box sx={{ flex: 1 }} />
         <Box sx={{ display: "flex", gap: 0.75, alignItems: "center" }} onClick={(e) => e.stopPropagation()}>
           {f.working.slice(0, 4).map((w) => (
             <Box key={w.tid} sx={{ display: "inline-flex", alignItems: "center", gap: 0.4 }}>
-              <Typography variant="caption" onClick={() => onOpenTask && onOpenTask(w.tid)} sx={{ ...{ fontFamily: "ui-monospace, monospace" }, color: "#47654a", fontSize: 10.5, fontWeight: 700, cursor: "pointer" }} title={w.title}>{w.ref}</Typography>
+              <Typography variant="caption" onClick={() => onOpenTask && onOpenTask(w.tid)} sx={{ ...mono, color: "#47654a", fontSize: 10.5, fontWeight: 700, cursor: "pointer" }} title={w.title}>{w.ref}</Typography>
               <TellAgentButton taskId={w.tid} taskRef={w.ref} small />
             </Box>
           ))}
@@ -162,7 +185,7 @@ const FunnelBar = ({ onOpenTask }) => {
           {f.queued.length === 0 && <Typography variant="caption" sx={{ color: FAINT, display: "block", py: 1 }}>Nothing waiting — every task from a rank-mode connector is being worked.</Typography>}
           {f.queued.map((q, i) => (
             <Box key={q.tid} sx={{ display: "flex", alignItems: "center", gap: 1.25, py: 0.6, borderTop: i ? `1px solid ${BORDER}` : "none" }}>
-              <Typography variant="caption" sx={{ ...{ fontFamily: "ui-monospace, monospace" }, color: "#5b5f97", fontWeight: 700, width: 18, fontSize: 11 }}>{i + 1}</Typography>
+              <Typography variant="caption" sx={{ ...mono, color: ROLES.working.ink, fontWeight: 700, width: 18, fontSize: 11 }}>{i + 1}</Typography>
               <Typography variant="body2" onClick={() => onOpenTask && onOpenTask(q.tid)} sx={{ fontSize: 12.5, fontWeight: 600, cursor: "pointer",
                 flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={q.title}>{q.title}</Typography>
               <Typography variant="caption" sx={{ color: DIM, fontSize: 10.5, whiteSpace: "nowrap", maxWidth: 320, overflow: "hidden", textOverflow: "ellipsis" }}
@@ -467,6 +490,9 @@ const TodayStrip = () => {
 };
 
 export default function FeedView({ onOpenTask, onChanged }) {
+  // below md there is no stage beside the rail; whatever is opened slides over it instead, so a
+  // tap on a row is never a tap that did nothing
+  const narrow = useMediaQuery("(max-width:899.95px)");
   const [calSel, setCalSel] = useState(null);        // a meeting opened from the coming-up band
   const calEvents = useCalToday();
   // The filter dock is a fixed flex sibling of the scroller. Rows never fade at its top edge;
@@ -492,27 +518,31 @@ export default function FeedView({ onOpenTask, onChanged }) {
   const dayRefs = useRef({});                        // day (YYYY-MM-DD) -> group element
   const dayLayout = useRef([]);                      // cached content offsets; scrolling must not force layout
   const dayLayoutDirty = useRef(true);
+  const dayLayoutAt = useRef(0);                     // the rail's scrollHeight when last measured
   const dateJump = useRef("");                       // picker owns the label during its smooth glide
   const dateJumpTimer = useRef(null);
   const [curDay, setCurDay] = useState("");
   const spy = useCallback(() => {
     const rail = railRef.current; if (!rail) return;
     if (dateJump.current) { setCurDay(dateJump.current); return; }
-    if (dayLayoutDirty.current) {
+    // ...and re-measure whenever the rail has grown since the last look: rows arriving after the
+    // first measurement left every group at top 0, and the last of those ties is the wrong day
+    if (dayLayoutDirty.current || rail.scrollHeight !== dayLayoutAt.current) {
       // Measure once after the rows/layout change. Reading every group's bounding box on every
       // wheel frame made Chromium synchronously lay out the whole rail while it was scrolling.
       const railTop = rail.getBoundingClientRect().top;
       dayLayout.current = Object.entries(dayRefs.current).flatMap(([day, el]) => el
         ? [{ day, top: el.getBoundingClientRect().top - railTop + rail.scrollTop }]
         : []).sort((a, b) => a.top - b.top);
-      dayLayoutDirty.current = false;
+      dayLayoutDirty.current = false; dayLayoutAt.current = rail.scrollHeight;
     }
     const edge = rail.scrollTop + 1;
     // the current day is the last group whose cached content edge has crossed the dock
-    let cur = "";
+    let cur = "", lastTop = -1;
     for (const entry of dayLayout.current) {
       if (entry.top > edge) break;
-      cur = entry.day;
+      if (entry.top === lastTop) continue;             // two groups at one top: nothing is laid out yet
+      cur = entry.day; lastTop = entry.top;
     }
     setCurDay((was) => cur || was);
   }, []);
@@ -529,6 +559,7 @@ export default function FeedView({ onOpenTask, onChanged }) {
   const [newOpen, setNewOpen] = useState(false);     // the ＋ New sheet (NewSheet.jsx)
   const [rows, setRows] = useState(null);
   const [view, setView] = useState("");              // "" everything | "pending" needs me
+  const [openFolds, setOpenFolds] = useState(() => new Set());   // conversations unfolded by hand
   const [cat, setCat] = useState("");                // broad content family; exact choices live in the source picker
   const [pick, setPick] = useState("");              // "" all in category | "channel:x" | "src:channel:name"
   const [srcByChannel, setSrcByChannel] = useState({});   // channel -> connection names
@@ -752,7 +783,8 @@ export default function FeedView({ onOpenTask, onChanged }) {
     // or Outlook, which is ingested as a `context` row and which the assistant has been reading
     // all along. The panel was the only place the history looked incomplete.
     const p = (row.TaskId ? api.get(`/api/tasks/${row.TaskId}`).then((r) => r.data)
-      : api.get(`/api/messages/${row.MessageId}/thread`).then((r) => ({ messages: r.data.messages || [] })))
+      : api.get(`/api/messages/${row.MessageId}/thread`).then((r) => ({ messages: r.data.messages || [],
+          routes: r.data.routes || [] })))
       .catch(() => ({ messages: [] }));                                  // panel falls back to the preview
     cache.current.set(row.MessageId, { at: Date.now(), p });
     return p;
@@ -763,6 +795,8 @@ export default function FeedView({ onOpenTask, onChanged }) {
   const [pinnedOn, setPinnedOn] = useState(false);
   const setPinned = (v) => { pinned.current = v; setPinnedOn(v); };
   const drill = async (row, quiet = false) => {
+    if (quiet && pinned.current && sel?.MessageId === row.MessageId) return;   // pinned outranks hover
+    if (!quiet) clearTimeout(hoverTimer.current);
     setCalSel(null);   // a message row takes the panel back from an opened meeting
     want.current = row.MessageId; setPinned(!quiet);
     const p = fetchDetail(row);
@@ -788,7 +822,7 @@ export default function FeedView({ onOpenTask, onChanged }) {
   const disarmClose = () => clearTimeout(leaveTimer.current);
   const armClose = () => {
     clearTimeout(leaveTimer.current);
-    if (pinned.current) return;
+    if (pinned.current || narrow) return;
     leaveTimer.current = setTimeout(() => {
       if (!pinned.current && !panelLock && !(editText ?? "").trim()) { clearTimeout(hoverTimer.current); setSel(null); }
     }, 400);
@@ -800,6 +834,7 @@ export default function FeedView({ onOpenTask, onChanged }) {
   const [panelLock, setPanelLock] = useState(false);
   const hoverSelect = (row) => {
     clearTimeout(hoverTimer.current);
+    if (narrow) return;                                 // a phone taps; the drawer opens on the tap
     if (!hoverArmed.current) return;
     if (sel?.MessageId === row.MessageId) return;
     if (sel && ((editText ?? "").trim() || panelLock)) return;   // don't yank an OPEN panel mid-edit
@@ -870,6 +905,19 @@ export default function FeedView({ onOpenTask, onChanged }) {
     if (day) days[day] = [];
   }
   const dayEntries = Object.entries(days).sort(([a], [b]) => b.localeCompare(a));
+  // ONE TASK, ONE ROW. Not one conversation: on a report, on the assistant's posts and in a
+  // WhatsApp chat the conversation id is the CHANNEL, so grouping on it collapsed five runs of
+  // one report, twelve assistant posts and a day of one person into single lines - and hid a
+  // photo the owner was hunting for. A task is the honest unit: triage or a thread put those
+  // messages together. Rows nothing has judged to be one thing never fold.
+  const foldOf = new Map(), memberOf = new Map();
+  for (const [, dayRows] of dayEntries) {
+    for (const e of groupThreads(dayRows)) {
+      if (e.kind !== "fold") continue;
+      foldOf.set(e.row.MessageId, e);                 // the newest member is where the fold sits
+      for (const m of e.rows) memberOf.set(m.MessageId, e.tid);
+    }
+  }
   const shownDay = dayEntries.some(([day]) => day === curDay) ? curDay : (dayEntries[0]?.[0] || "");
   const jumpToDay = (day) => {
     dateJump.current = day;
@@ -905,7 +953,7 @@ export default function FeedView({ onOpenTask, onChanged }) {
   const todayMeetings = timelineMeetings.filter((e) => localDay(e.start) === today).length;
   const stats = [{ label: "in today", n: todays.length + todayMeetings, f: "" }, ...[
     { label: "auto", n: todays.filter((r) => r.ReviewStatus === "auto").length, f: "" },
-    { label: "needs me", n: (rows || []).filter(needsYou).length, f: "pending", hot: true },
+    ...(narrow ? [] : [{ label: "needs me", n: (rows || []).filter(needsYou).length, f: "pending", hot: true }]),
     { label: "info", n: todays.filter((r) => r.Category === "info").length, f: "" },
     { label: "promo", n: todays.filter((r) => r.Category === "promo").length, f: "" },
     { label: "ignored", n: todays.filter((r) => r.MsgStatus === "ignored").length, f: "" },
@@ -938,13 +986,23 @@ export default function FeedView({ onOpenTask, onChanged }) {
 
           {/* filters: one segmented control for STATE, one quiet picker for WHERE FROM. Two
               rows of loose pills of two different kinds read as a settings panel, not a filter. */}
-          <Box sx={{ display: "flex", alignItems: "center", gap: 1, minWidth: 0 }}>
-            <FilterPills options={VIEW_FILTERS} value={view} onChange={setView} />
+          {/* wraps: on a phone the pickers and New drop to a second row as one group, under the
+              pill, instead of the whole row scrolling sideways */}
+          <Box sx={{ display: "flex", alignItems: "center", gap: 1, minWidth: 0, flexWrap: "wrap" }}>
+            {narrow
+              ? <NeedsMe on={view === "pending"} n={(rows || []).filter(needsYou).length}
+                  onClick={() => setView(view === "pending" ? "" : "pending")} />
+              : <FilterPills options={VIEW_FILTERS} value={view} onChange={setView} />}
+            {/* on a phone the pickers take a full second line and New sits beside the pill; from md
+                up the three share one line, right-aligned */}
+            <Box sx={{ display: "flex", alignItems: "center", gap: 1, ml: { md: "auto" }, minWidth: 0,
+              order: { xs: 3, md: 2 }, flex: { xs: "1 1 100%", md: "0 0 auto" },
+              "& > .MuiInputBase-root": { flex: { xs: 1, md: "0 0 auto" } } }}>
             <Select size="small" value={cat} displayEmpty onChange={(e) => setCat(e.target.value)}
               inputProps={{ "aria-label": "Timeline category" }}
-              renderValue={(v) => CATEGORIES.find((o) => o.key === v)?.label || "everything"}
+              renderValue={(v) => CATEGORIES.find((o) => o.key === v)?.label || "all kinds"}
               sx={{ height: 34, fontSize: 11.5, fontWeight: 600, borderRadius: 2, bgcolor: PANEL2,
-                color: cat ? INK : DIM, flexShrink: 0, ml: "auto",
+                color: cat ? INK : DIM, flexShrink: 0,
                 "& .MuiSelect-select": { py: 0.25, px: 1.15 },
                 "& .MuiOutlinedInput-notchedOutline": { borderColor: BORDER } }}>
               {CATEGORIES.map((o) => <MenuItem key={o.key} value={o.key} sx={{ fontSize: 12 }}>{o.label}</MenuItem>)}
@@ -957,7 +1015,7 @@ export default function FeedView({ onOpenTask, onChanged }) {
                 : v.startsWith("channel:") ? `all ${CHANNEL_LABELS[v.slice(8)] || v.slice(8)}`.toLowerCase()
                   : String(v.split(":").slice(2).join(":")).split("@")[0])}
               sx={{ height: 34, fontSize: 11.5, fontWeight: 600, borderRadius: 2, bgcolor: PANEL2,
-                color: pick ? INK : DIM, flex: "0 0 104px", width: 104, minWidth: 104, maxWidth: 104,
+                color: pick ? INK : DIM, flex: { xs: 1, md: "0 0 104px" }, width: { md: 104 }, minWidth: 104, maxWidth: { md: 104 },
                 "& .MuiSelect-select": { py: 0.25, px: 1.15 },
                 "& .MuiOutlinedInput-notchedOutline": { borderColor: BORDER } }}>
               {/* 96 discovered buckets turned this into a page-long wall. It is a bounded,
@@ -998,10 +1056,11 @@ export default function FeedView({ onOpenTask, onChanged }) {
             </Select>
             {/* New starts work, so it stays visually distinct, but it belongs on this toolbar —
                 not alone on a wasteful row above it. */}
+            </Box>
             <Button size="small" variant="contained" disableElevation onClick={() => setNewOpen(true)}
               startIcon={<AddIcon sx={{ fontSize: 15 }} />}
               sx={{ flexShrink: 0, height: 34, minWidth: 68, py: 0.25, px: 1.1, borderRadius: 2,
-                fontSize: 11.5, background: GRADIENT }}>New</Button>
+                fontSize: 11.5, background: GRADIENT, order: { xs: 2, md: 3 }, ml: { xs: "auto", md: 0 } }}>New</Button>
           </Box>
 
           {/* The counts describe what is in the rail. The date and sync clock belong together
@@ -1043,7 +1102,7 @@ export default function FeedView({ onOpenTask, onChanged }) {
               {syncing || bgSync ? (syncWhat || "syncing…")
                 : !every ? "background sync off"
                 : `synced ${lastSync ? lastSync.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" }) : "—"}`
-                  + (nextIn != null ? ` · next ${Math.floor(nextIn / 60)}:${String(nextIn % 60).padStart(2, "0")}` : "")}
+                  + (nextIn == null ? "" : nextIn <= 0 ? " · next sync due now" : ` · next in ${Math.floor(nextIn / 60)}:${String(nextIn % 60).padStart(2, "0")}`)}
             </Typography>
             <Button size="small" variant="text" disabled={syncing || bgSync} onClick={() => syncNow(false)}
               title={syncing || bgSync ? syncWhat : "read the mailboxes, chats and repos now"}
@@ -1116,7 +1175,7 @@ export default function FeedView({ onOpenTask, onChanged }) {
                 if (el) dayRefs.current[day] = el; else delete dayRefs.current[day];
                 dayLayoutDirty.current = true;
               }}>
-                {di === 0 && !cat && !pick && <ComingUp events={upcoming} picked={calSel} onPick={(e) => { setSel(null); setCalSel(e); }} />}
+                {di === 0 && !view && !cat && !pick && <ComingUp events={upcoming} picked={calSel} onPick={(e) => { setSel(null); setCalSel(e); }} />}
                 <Box>
                   {items.map((r, i) => {
                     // ONE state per row, from one table (timelineState.js). It renders as a small
@@ -1124,6 +1183,15 @@ export default function FeedView({ onOpenTask, onChanged }) {
                     // a coloured pill on every row makes the whole column loud, which is the same
                     // as making none of it loud.
                     const st = stateOf(r);
+                    const fold = foldOf.get(r.MessageId);
+                    const inFold = memberOf.get(r.MessageId);
+                    // A member is never drawn HERE, open or shut - the fold draws its own, in one
+                    // block. Revealing them in place looked right until a fold opened: its members
+                    // are not contiguous, so an unrelated row landing between two of them (a CI
+                    // email in the same minute as two chat lines) appeared inside the group.
+                    // display:none rather than skipping the entry, because the meeting slots are
+                    // placed by INDEX into this day's rows and dropping one would move them.
+                    const showRow = !inFold;
                     const open = sel?.MessageId === r.MessageId;
                     // hovering PREVIEWS (a soft edge, the stage follows the cursor); clicking
                     // PINS (a ring in the brand colour, the stage holds). Both used to draw the
@@ -1131,12 +1199,23 @@ export default function FeedView({ onOpenTask, onChanged }) {
                     const held = open && pinnedOn;
                     return (
                       <React.Fragment key={r.MessageId}>
-                        {!cat && !pick && meetingsAt(day, items, i).map((e, j) => (
+                        {/* the calendar is filtered like everything else. "needs me" means work waiting on
+                            you, and a meeting is never that - it sat in the list regardless, so a
+                            filter that should have shown three rows showed four. */}
+                        {!view && !cat && !pick && meetingsAt(day, items, i).map((e, j) => (
                           <MeetingRow key={`m-${e.start}-${j}`} e={e} picked={calSel}
                             preps={prepFor[evKey(e)] || []} onOpenRow={(p) => { setCalSel(null); drill(p); }}
                             onPick={(ev) => { setSel(null); setCalSel(ev); }} />
                         ))}
-                        <Box className="tqRow" sx={{ display: "grid", gridTemplateColumns: `${GUTTER}px 14px minmax(0,1fr)`,
+                        {fold && (
+                          <ThreadFold entry={fold} open={openFolds.has(fold.tid)} onOpenRow={drill} sel={sel}
+                            onToggle={() => setOpenFolds((cur) => {
+                              const next = new Set(cur);
+                              if (next.has(fold.tid)) next.delete(fold.tid); else next.add(fold.tid);
+                              return next;
+                            })} />
+                        )}
+                        <Box className="tqRow" sx={{ display: showRow ? "grid" : "none", gridTemplateColumns: `${GUTTER}px 14px minmax(0,1fr)`,
                           alignItems: "stretch", mb: "3px",
                           ...(seen.current.has(r.MessageId) ? {} : { ...fadeIn, animationDelay: `${Math.min(i * 35, 320)}ms`, animationFillMode: "backwards" }) }}>
                           {/* the clock sits in its own gutter with air on BOTH sides - 8px off the
@@ -1211,7 +1290,7 @@ export default function FeedView({ onOpenTask, onChanged }) {
                     );
                   })}
                   {/* meetings that started before the oldest message of the day shown so far */}
-                  {!cat && !pick && meetingsAt(day, items, items.length).map((e, j) => (
+                  {!view && !cat && !pick && meetingsAt(day, items, items.length).map((e, j) => (
                     <MeetingRow key={`m-${e.start}-${j}`} e={e} picked={calSel}
                             preps={prepFor[evKey(e)] || []} onOpenRow={(p) => { setCalSel(null); drill(p); }}
                             onPick={(ev) => { setSel(null); setCalSel(ev); }} />
@@ -1264,6 +1343,22 @@ export default function FeedView({ onOpenTask, onChanged }) {
           )}
       </Box>
 
+      {/* the same stage, over the rail, on a phone */}
+      {narrow && (
+        <Drawer anchor="right" open={!!(sel || calSel)} data-tq-keep
+          onClose={() => { setPinned(false); setSel(null); setCalSel(null); }}
+          PaperProps={{ sx: { width: "100%", p: 1, bgcolor: BG, borderRadius: 0 } }}>
+          {calSel && !sel ? <EventPanel e={calSel} onClose={() => setCalSel(null)} onOpenTask={onOpenTask} />
+            : sel ? (
+              <ReviewCanvas sel={sel} detail={detail} editText={editText} setEditText={setEditText}
+                decide={decide} onOpenTask={onOpenTask} onClose={() => { setPinned(false); setSel(null); }}
+                onSkipped={() => { setSel(null); load(); onChanged?.(); }} onRefresh={() => load()}
+                onMessageChanged={messageBodyChanged}
+                sendErr={sendErr} clearSendErr={() => setSendErr("")} onLock={setPanelLock} />
+            ) : null}
+        </Drawer>
+      )}
+
       <NewSheet open={newOpen} onClose={() => setNewOpen(false)} onOpenTask={onOpenTask}
         onDone={() => { load(); onChanged?.(); }} />
     </Box>
@@ -1280,9 +1375,20 @@ const fmtDay = (d) => {
 const historyOf = (sel, detail) => {
   const ev = [];
   if (detail?.task) ev.push({ at: detail.task.CreatedAt, label: `Task ${detail.ref} opened`, sub: detail.task.Kind, c: "#55697a" });
-  (detail?.routes || []).forEach((r) => ev.push({ at: detail.task?.CreatedAt, c: "#6f8a6e",
-    label: r.Decision === "attach" ? "Routed — attached to this thread"
-      : r.Decision === "create" ? "Routed — new task created" : `Routed — ${r.Decision}` }));
+  // An `ignore` route is the OWNER overruling triage - "not ours" - and it is the judgement
+  // most worth reading back, because it is the one that taught the funnel something. It used to
+  // vanish from the panel entirely: the verdict deletes the task, the history was read off the
+  // task, so the record of the correction died with the thing it corrected.
+  (detail?.routes || []).forEach((r) => ev.push({
+    at: r.CreatedAt || detail?.task?.CreatedAt,
+    c: r.Decision === "ignore" ? "#8a3646" : "#6f8a6e",
+    label: r.Decision === "ignore" ? "You said: not ours"
+      : r.Decision === "attach" ? "Routed — attached to this thread"
+      : r.Decision === "create" ? "Routed — new task created" : `Routed — ${r.Decision}`,
+    sub: r.Decision === "ignore"
+      ? cleanText(String(r.Reason || "")).replace(/^not ours\s*[-—]\s*/i, "").slice(0, 70)
+      : undefined,
+  }));
   (detail?.runs || []).forEach((r) => ev.push({ at: r.StartedAt, label: `${r.AgentName} run`, sub: r.Status,
     c: r.Status === "error" ? "#6b2733" : "#6f8a6e" }));
   (detail?.comments || []).filter((c) => c.ActorType === "human").forEach((c) =>
@@ -1385,6 +1491,7 @@ const ReviewCanvas = ({ sel, detail, editText, setEditText, decide, onOpenTask, 
   // one click turns a flood sender (100s of automated mails) into a skip policy - their
   // mail is deduped but never shows on the timeline again, and their HISTORY goes with it
   const [skipped, setSkipped] = useState(null);
+  const [skipConfirm, setSkipConfirm] = useState(false);
   const [tab, setTab] = useState("summary");      // overview first; four detailed stages remain one click away
   const [filing, setFiling] = useState("");       // "once" teaches nothing; "learn" writes one Memory verdict
   const [fileErr, setFileErr] = useState("");
@@ -1413,7 +1520,7 @@ const ReviewCanvas = ({ sel, detail, editText, setEditText, decide, onOpenTask, 
     catch { /* session gone between render and click: the row's hint still points at the task */ }
   };
   useEffect(() => { setReshape(false); setHandoff(false); setOpened(null); setOpening(false); setHanded(false);
-    setTab("summary"); setFiling(""); setFileErr(""); }, [sel.MessageId]);
+    setTab("summary"); setFiling(""); setFileErr(""); setNotCoding(false); setRouteErr(""); setSkipConfirm(false); }, [sel.MessageId]);
   const fileMessage = async (learn) => {
     setFiling(learn ? "learn" : "once"); setFileErr("");
     try {
@@ -1487,6 +1594,9 @@ const ReviewCanvas = ({ sel, detail, editText, setEditText, decide, onOpenTask, 
     ? "fyi" : (roadOf(sel) || "not routed");
 
   const [mined, setMined] = useState(null);          // "Mine to do" made a task, and its ref
+  const [notCoding, setNotCoding] = useState(false); // "Mine, not agent" landed - the button says so
+  const [routeErr, setRouteErr] = useState("");      // ...or was refused, and the reason is shown here
+  const [closed, setClosed] = useState(null);        // ...and closing one from the panel
   const [releasing, setReleasing] = useState(false);
   const release = async () => {
     setReleasing(true);
@@ -1512,7 +1622,7 @@ const ReviewCanvas = ({ sel, detail, editText, setEditText, decide, onOpenTask, 
               {sel.Subject || `${sel.FromName || sel.FromEmail} in ${sel.SourceName || "chat"}`}
             </Typography>
             <Typography variant="caption" sx={{ color: FAINT, display: "block" }} noWrap>
-              {sel.FromName || sel.FromEmail}{sel.SourceName ? ` · ${sel.SourceName}` : ""} · {fmtDateTime(sel.SentAt)}
+              {sel.FromName || sel.FromEmail}{sel.SourceName && String(sel.SourceName).toLowerCase() !== String(sel.FromName || "").toLowerCase() ? ` · ${sel.SourceName}` : ""} · {fmtDateTime(sel.SentAt)}
             </Typography>
           </Box>
           <RefChip taskId={sel.TaskId} onClick={() => onOpenTask(sel.TaskId)} />
@@ -1542,7 +1652,8 @@ const ReviewCanvas = ({ sel, detail, editText, setEditText, decide, onOpenTask, 
 
         {/* Summary is the fifth, default view. The original four stages remain full detail views. */}
         <Box role="tablist" aria-label="Message workflow views"
-          sx={{ display: "flex", gap: 0.25, px: 2, borderBottom: `1px solid ${BORDER}`, flexShrink: 0 }}>
+          sx={{ display: "flex", gap: 0.25, px: 2, borderBottom: `1px solid ${BORDER}`, flexShrink: 0,
+            overflowX: "auto", scrollbarWidth: "none", "&::-webkit-scrollbar": { display: "none" } }}>
           {tabs.map((item) => (
             <Box key={item.key} role="tab" aria-selected={tab === item.key} tabIndex={tab === item.key ? 0 : -1}
               onClick={() => setTab(item.key)}
@@ -1730,6 +1841,19 @@ const ReviewCanvas = ({ sel, detail, editText, setEditText, decide, onOpenTask, 
                       setMined(data.ref); onRefresh?.(); } catch { /* the row keeps its state */ }
                   }}>{mined || "Add to my tasks"}</TrayBtn>
               )}
+              {/* Closing it needed the Tasks tab, which is a trip away from the row you are
+                  reading - so a finished piece of work kept saying "on your list" because marking
+                  it done was somewhere else. */}
+              {sel.TaskId && !["done", "dropped"].includes(sel.TaskStatus) && (
+                <TrayBtn disabled={!!closed} icon={<CheckIcon sx={{ fontSize: 16 }} />}
+                  title="closes the task from here - the agent's report and the thread stay"
+                  onClick={async () => {
+                    try {
+                      await api.patch(`/api/tasks/${sel.TaskId}`, { Status: "done" });
+                      setClosed("Closed"); onRefresh?.();
+                    } catch { /* the row keeps its state */ }
+                  }}>{closed || "Mark done"}</TrayBtn>
+              )}
               {onIt && sel.MessageId && (
                 <TrayBtn disabled={handed} onClick={handToAgent} icon={<ForwardToInboxIcon sx={{ fontSize: 15 }} />}
                   title="their message is typed into the live session, as if you relayed it">
@@ -1757,7 +1881,7 @@ const ReviewCanvas = ({ sel, detail, editText, setEditText, decide, onOpenTask, 
                   title="files this message and adds one verdict to Memory for later triage" onClick={() => fileMessage(true)}>
                   {filing === "learn" ? "Teaching triage…" : "Nothing to do"}</TrayBtn>
               </Box>
-              {fileErr && <Typography variant="caption" sx={{ display: "block", color: "#b42318",
+              {fileErr && <Typography variant="caption" sx={{ display: "block", color: ROLES.bad.ink,
                 fontWeight: 600, mt: 0.75 }}>{fileErr} — nothing changed.</Typography>}
             </Box>
 
@@ -1765,11 +1889,13 @@ const ReviewCanvas = ({ sel, detail, editText, setEditText, decide, onOpenTask, 
               <TrayGroupLabel note="correct who owns it; MEMORY choices teach future triage">ROUTING</TrayGroupLabel>
               <Box sx={{ display: "flex", gap: 0.8, flexWrap: "wrap", alignItems: "center" }}>
                 {sel.TaskId && (
-                  <TrayBtn tone="teach" teaches icon={<PsychologyOutlinedIcon sx={{ fontSize: 16 }} />}
+                  <TrayBtn tone="teach" teaches disabled={notCoding} icon={<PsychologyOutlinedIcon sx={{ fontSize: 16 }} />}
                     title="make this your task instead of agent work, and remember that choice"
                     onClick={async () => {
-                      await api.post(`/api/tasks/${sel.TaskId}/not-coding`); onRefresh?.();
-                    }}>Mine, not agent</TrayBtn>
+                      setRouteErr("");
+                      try { await api.post(`/api/tasks/${sel.TaskId}/not-coding`); setNotCoding(true); onRefresh?.(); }
+                      catch (e) { setRouteErr(e?.response?.data?.detail || "that did not work"); }
+                    }}>{notCoding ? "Now yours" : "Mine, not agent"}</TrayBtn>
                 )}
                 {sel.TaskId && (
                   <TrayBtn icon={<CallSplitIcon sx={{ fontSize: 15 }} />}
@@ -1779,14 +1905,20 @@ const ReviewCanvas = ({ sel, detail, editText, setEditText, decide, onOpenTask, 
                 <NotMine compact messageId={sel.MessageId} onDone={onSkipped} onLock={onLock} />
                 <SplitTask compact row={sel} onSplit={() => onRefresh?.()} />
               </Box>
+              {routeErr && <Typography variant="caption" sx={{ display: "block", color: ROLES.bad.ink, fontWeight: 600, mt: 0.75 }}>{routeErr} — nothing changed.</Typography>}
 
               {sel.Channel === "email" && sel.FromEmail && (
                 <Box sx={{ mt: 1.1 }}>
                   <TrayGroupLabel note="hide this address now and remember that rule">SENDER RULES</TrayGroupLabel>
-                  <TrayBtn tone="teach" teaches disabled={skipped !== null} onClick={skipSender}
+                  <TrayBtn tone="teach" teaches disabled={skipped !== null} onClick={() => setSkipConfirm(true)}
                     icon={<PsychologyOutlinedIcon sx={{ fontSize: 16 }} />}
                     title={`hide ${sel.FromEmail} and their past mail — undo in Settings`}>
                     {skipped !== null ? `Skipped${skipped ? ` · ${skipped} hidden` : ""}` : "Skip sender"}</TrayBtn>
+                  <Confirm open={skipConfirm} onClose={() => setSkipConfirm(false)} confirmLabel="Skip this sender"
+                    title={`Skip everything from ${sel.FromEmail}?`}
+                    text={"Their mail leaves the Timeline now - what they already sent, and everything after it. "
+                      + "It is still received and kept; it just never shows here again. The rule lives under Settings → Routing policies, where it can be switched off."}
+                    onConfirm={skipSender} />
                 </Box>
               )}
             </Box>
@@ -1902,8 +2034,96 @@ const TalkItThrough = ({ messageId, onOpenTask }) => {
   );
 };
 
+// A conversation, folded. Nine rows reading "Teams chat with Priya Shah" is not a day you can
+// read - so the rail carries ONE line for the thread, with the count, the span it covers and the
+// loudest thing inside it. Expanding reveals the real rows, unchanged, underneath.
+//
+// The state is the LOUDEST member's, never the newest: a reply waiting two messages down must not
+// be hidden by a fold whose top line happens to be fyi. Folding is not a way to lose work.
+const ThreadFold = ({ entry, open, onToggle, onOpenRow, sel }) => {
+  const rows = entry.rows;
+  const st = loudest(rows, stateOf, LOUDNESS);
+  const head = rows[0];
+  const who = [...new Set(rows.map((r) => r.FromName || r.SourceName).filter(Boolean))];
+  return (
+    <Box sx={{ display: "grid", gridTemplateColumns: `${GUTTER}px 14px minmax(0,1fr)`,
+      alignItems: "stretch", mb: "3px" }}>
+      <Typography sx={{ ...mono, fontSize: 10, color: FAINT, textAlign: "right",
+        pt: "6px", pl: "8px", pr: "12px", whiteSpace: "nowrap", letterSpacing: "-.2px",
+        fontVariantNumeric: "tabular-nums" }}>
+        {fmtTime12(head.SentAt)}
+      </Typography>
+      <Box sx={{ position: "relative" }}>
+        <Box sx={{ position: "absolute", left: "6px", top: "-5px", bottom: "-5px", width: "1px", bgcolor: BORDER }} />
+        <Box sx={{ position: "absolute", left: "2.5px", top: "9px", width: 8, height: 8, borderRadius: "50%",
+          bgcolor: edgeOf(st), boxShadow: `0 0 0 3px ${PANEL}` }} />
+      </Box>
+      <Box onClick={onToggle} data-tq-keep
+        title={open ? "fold this conversation back up" : `${rows.length} messages on one conversation - open it`}
+        sx={{ bgcolor: PANEL, border: `1px solid ${BORDER}`, borderLeft: `2px solid ${edgeOf(st)}`,
+          borderRadius: "8px", px: "10px", pt: "3px", pb: "4px", ml: "8px", minWidth: 0, overflow: "hidden",
+          cursor: "pointer", transition: "box-shadow .18s, border-color .18s",
+          "&:hover": { borderColor: "#d8cfbe", boxShadow: "0 2px 8px rgba(47,107,79,.10)" } }}>
+        <Box sx={{ display: "flex", gap: 0.85, alignItems: "center", minWidth: 0, minHeight: 22 }}>
+          <Box component="span" aria-hidden sx={{ display: "flex", flexShrink: 0, color: FAINT,
+            transform: open ? "rotate(0deg)" : "rotate(-90deg)", transition: "transform .15s" }}>
+            <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+              strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"><path d="M4 6l4 4 4-4" /></svg>
+          </Box>
+          <Box sx={{ display: "flex", flexShrink: 0 }}><ChannelIcon channel={head.Channel} sx={{ fontSize: 16 }} /></Box>
+          <Typography variant="body2" noWrap sx={{ fontWeight: 600, color: INK, fontSize: 12, flexShrink: 1, minWidth: 56, maxWidth: 150 }}>
+            {who.slice(0, 2).join(", ")}{who.length > 2 ? ` +${who.length - 2}` : ""}
+          </Typography>
+          <Typography variant="body2" noWrap sx={{ color: DIM, fontSize: 11.5, flex: 1, minWidth: 0 }}>
+            {cleanText(String(head.Subject || "")) || "conversation"}
+          </Typography>
+          <Typography variant="caption" sx={{ ...mono, fontSize: 9.5, fontWeight: 600, color: ROLES.info.ink,
+            bgcolor: ROLES.info.tint, border: `1px solid ${ROLES.info.bd}`, borderRadius: 99, px: 0.75,
+            lineHeight: "15px", flexShrink: 0 }}>{rows.length}</Typography>
+          <StateMark row={head} state={st} />
+        </Box>
+        <Box sx={{ display: "grid", gridTemplateRows: open ? "0fr" : "1fr", transition: "grid-template-rows .2s ease" }}>
+          <Box sx={{ overflow: "hidden" }}>
+            <Typography noWrap sx={{ fontSize: 10.5, lineHeight: 1.5, pt: "2px", pl: "20px", color: FAINT }}>
+              {spanText(rows, fmtTime12)}
+            </Typography>
+          </Box>
+        </Box>
+        {/* the members, INSIDE the card and indented under the caret - so the group is one block
+            and nothing that merely shares a minute with it can land in the middle */}
+        {open && rows.map((m) => (
+          <Box key={m.MessageId} onClick={(ev) => { ev.stopPropagation(); onOpenRow?.(m); }}
+            sx={{ display: "flex", alignItems: "center", gap: 0.85, minWidth: 0, py: 0.5, pl: "20px",
+              borderTop: `1px solid ${BORDER}`, cursor: "pointer",
+              bgcolor: sel?.MessageId === m.MessageId ? PANEL2 : "transparent",
+              "&:hover .tqKid": { color: INK } }}>
+            <Typography sx={{ ...mono, fontSize: 9.5, color: FAINT, flexShrink: 0,
+              fontVariantNumeric: "tabular-nums" }}>{fmtTime12(m.SentAt)}</Typography>
+            <Box sx={{ display: "flex", flexShrink: 0 }}><ChannelIcon channel={m.Channel} sx={{ fontSize: 14 }} /></Box>
+            <Typography noWrap className="tqKid" sx={{ fontSize: 11.5, fontWeight: 600, color: DIM,
+              flexShrink: 0, maxWidth: 120, transition: "color .15s" }}>
+              {m.FromName || m.SourceName || "—"}
+            </Typography>
+            <Typography noWrap sx={{ fontSize: 11, color: FAINT, flex: 1, minWidth: 0 }}>
+              {cleanText(String(m.Preview || m.Subject || ""))}
+            </Typography>
+            <StateMark row={m} showWord={stateMeta(st).loud && stateOf(m) === st} />
+          </Box>
+        ))}
+      </Box>
+    </Box>
+  );
+};
+
 const TriagePane = ({ sel, detail, onRefresh }) => {
   const road = roadOf(sel);
+  // every judgement made about this message, oldest first. "And why" below is only the LATEST
+  // one, which is why a correction was invisible here: the owner clicks "not ours", the verdict
+  // changes, and the panel showed the new sentence with no sign that anyone had overruled
+  // anything. Routes are keyed on the message, so they survive the task the verdict deletes.
+  // ...about THIS message. On a task row detail.routes covers every message on the task, and a
+  // thread's other rows were judged separately - their reasons are not this row's history.
+  const trail = (detail?.routes || []).filter((r) => !r.MessageId || r.MessageId === sel.MessageId);
   // the sentence the classifier wrote, without the routing bookkeeping after it
   const why = String(sel.RouteReason || "").replace(/^triage:\s*\w+\s*-\s*/, "").split(" · ")[0];
   const rest = String(sel.RouteReason || "").split(" · ").slice(1);
@@ -1939,6 +2159,33 @@ const TriagePane = ({ sel, detail, onRefresh }) => {
           </Typography>
         )}
       </Box>
+      {trail.length > 1 && (
+        <>
+          <PanelLabel>How it got here</PanelLabel>
+          <Box sx={{ border: `1px solid ${BORDER}`, borderRadius: 1.5, px: 1.5, py: 0.25, bgcolor: "#fcfaf7" }}>
+            {trail.map((r, i) => {
+              const mine = r.Decision === "ignore";
+              return (
+                <Box key={r.RouteId || i} sx={{ display: "flex", alignItems: "baseline", gap: 1, py: 0.65,
+                  borderTop: i ? `1px solid ${BORDER}` : "none" }}>
+                  <Typography variant="caption" sx={{ fontWeight: 700, flexShrink: 0,
+                    color: mine ? ALERT_INK : DIM }}>
+                    {mine ? "You said: not ours" : `triage · ${r.Decision}`}
+                  </Typography>
+                  <Typography variant="caption" noWrap sx={{ color: FAINT, flex: 1, minWidth: 0 }}>
+                    {cleanText(String(r.Reason || "")).replace(/^(not ours|triage:)\s*[-\u2014:]?\s*/i, "").split(" \u00b7 ")[0]}
+                  </Typography>
+                  {r.CreatedAt && (
+                    <Typography variant="caption" sx={{ ...mono, fontSize: 9.5, color: FAINT, flexShrink: 0 }}>
+                      {fmtDateTime(r.CreatedAt)}
+                    </Typography>
+                  )}
+                </Box>
+              );
+            })}
+          </Box>
+        </>
+      )}
       <Typography variant="caption" sx={{ color: FAINT, display: "block", mt: 1.25, lineHeight: 1.6 }}>
         Correcting this teaches it: the verdict you give lands in TRIAGE.md and applies to the next
         message like this one, not as a rule about this sender.
@@ -2025,6 +2272,7 @@ const MessageBlock = ({ messages, focusId, fallback }) => {
   const text = cut >= 0 ? whole.slice(0, cut).trimEnd() : whole;
   const raw = cut >= 0 ? whole.slice(cut + RAW.length).trim() : "";
   const you = cur?.Status === "context";
+  const own = !you && cur?.Channel === "own";        // a note you left yourself: nothing arrived
   // an excerpt first. A PR body or a forwarded chain ran the panel into its own scrollbar
   // and pushed the choices under the fold; the first screen of a message is what the
   // decision needs, and the rest is one click, not a scroll, away
@@ -2037,11 +2285,31 @@ const MessageBlock = ({ messages, focusId, fallback }) => {
   const shown = full || !long ? text : excerpt;
   const today = new Date().toLocaleDateString("sv-SE");
   const pt = (s) => (localDay(s) === today ? fmtTime12(s) : `${(localDay(s) || "").slice(5)} · ${fmtTime12(s)}`);
+  // The strip is for PICKING a message. It drew one chip per message in the thread, which was
+  // fine while a task-less row fetched only itself - then /thread started handing over the whole
+  // conversation and a WhatsApp group chat filled six rows with a month of "Sam · 08-30". The
+  // recent ones, and a way back to the rest.
+  const CHIPS = 10;
+  const [allChips, setAllChips] = useState(false);
+  useEffect(() => setAllChips(false), [focusId]);
+  const earlier = Math.max(0, msgs.length - CHIPS);
+  let chips = allChips || !earlier ? msgs : msgs.slice(-CHIPS);
+  // ...and never hide the one being read: an old message opened from the rail must show as picked
+  if (cur && !chips.some((m) => m.MessageId === cur.MessageId)) chips = [cur, ...chips];
   return (
     <>
       {msgs.length > 1 && (
         <Box sx={{ display: "flex", gap: 0.5, flexWrap: "wrap", mb: 0.75 }}>
-          {msgs.map((m) => {
+          {!!earlier && !allChips && (
+            <Box onClick={() => setAllChips(true)}
+              title={`show the other ${earlier} on this thread`}
+              sx={{ px: 1.1, py: 0.35, borderRadius: 99, cursor: "pointer", fontSize: 11, fontWeight: 600,
+                border: `1px dashed ${BORDER}`, color: FAINT, bgcolor: "transparent", whiteSpace: "nowrap",
+                "&:hover": { borderColor: "#d8cfbe", color: "#55697a" } }}>
+              +{earlier} earlier
+            </Box>
+          )}
+          {chips.map((m) => {
             const on = cur && m.MessageId === cur.MessageId;
             const you = m.Status === "context";
             return (
@@ -2061,10 +2329,10 @@ const MessageBlock = ({ messages, focusId, fallback }) => {
         {/* who / which way / when - so "new inbound" is never confused with "your reply" */}
         {cur && (
           <Box sx={{ display: "flex", alignItems: "center", gap: 0.75, mb: 0.6, flexWrap: "wrap" }}>
-            <Chip size="small" label={you ? "↩ your reply" : "inbound"}
+            <Chip size="small" label={you ? "↩ your reply" : own ? "your note" : "inbound"}
               sx={{ height: 17, fontSize: 9.5, fontWeight: 700, letterSpacing: 0.3,
-                bgcolor: you ? ROLES.working.tint : ROLES.muted.tint,
-                color: you ? ROLES.working.ink : ROLES.muted.ink }} />
+                bgcolor: you || own ? ROLES.working.tint : ROLES.muted.tint,
+                color: you || own ? ROLES.working.ink : ROLES.muted.ink }} />
             <Typography variant="caption" sx={{ color: INK, fontWeight: 600 }}>
               {you ? "you" : cur.FromName || cur.FromEmail || "unknown"}
             </Typography>
@@ -2073,6 +2341,8 @@ const MessageBlock = ({ messages, focusId, fallback }) => {
           </Box>
         )}
         {cur?.Channel === "report" ? (looksMd(text) ? <Md text={text} /> : <SectionedText text={text} />)
+          : own && (!text.trim() || text === "…")
+            ? <Typography variant="body2" sx={{ color: FAINT, fontStyle: "italic" }}>You started this yourself — there is no incoming message behind it.</Typography>
           : <Typography variant="body2" sx={{ whiteSpace: "pre-wrap", color: INK, textAlign: "left" }}>
               {shown}
             </Typography>}

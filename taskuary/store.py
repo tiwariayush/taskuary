@@ -186,6 +186,7 @@ CREATE INDEX IF NOT EXISTS idx_lore_topic ON lore(Topic, LoreId);
 CREATE TABLE IF NOT EXISTS lore_comment (CommentId INTEGER PRIMARY KEY, LoreId INTEGER, Body TEXT,
   Author TEXT, CreatedAt TEXT);
 CREATE INDEX IF NOT EXISTS idx_lore_comment ON lore_comment(LoreId, CommentId);
+CREATE TABLE IF NOT EXISTS lore_vote (LoreId INTEGER, Actor TEXT, Delta INTEGER, At TEXT, PRIMARY KEY (LoreId, Actor));
 """
 # the knowledge base's search index (knowledge.py). A VIRTUAL table, kept out of SCHEMA: a Python
 # built without FTS5 must still open the store - search then falls back to LIKE over kb_chunk.
@@ -308,6 +309,10 @@ DEFAULT_ROLES = {'outlook': 'trigger,tool', 'teams': 'trigger,tool', 'slack': 't
                  # the books are read-only here: report and tool, never trigger. Intacct does
                  # not push, and an agent that can WRITE a journal entry is a different product
                  'intacct': 'report,tool',
+                 # QuickBooks is the first Corporate system that can WRITE (a bill, an expense) -
+                 # still report and tool, never trigger; the writes are gated by scope, not by role
+                 'quickbooks': 'report,tool',
+                 'teller': 'report,tool',          # the bank feed: transactions as a report (and "can become work"), balances as a tool
                  # research reads the public web - a report source, and a tool an agent may use
                  'exa': 'report,tool', 'tavily': 'report,tool',
                  'firecrawl': 'report,tool', 'reader': 'report,tool',
@@ -442,7 +447,7 @@ class SQLiteStore:
                          ('trello', 'Trello'), ('notion', 'Notion'), ('discord', 'Discord'),
                          ('sentry', 'Sentry'), ('pagerduty', 'PagerDuty'),
                          ('prometheus', 'Prometheus'), ('datadog', 'Datadog'),
-                         ('intacct', 'Sage Intacct'),
+                         ('intacct', 'Sage Intacct'), ('quickbooks', 'QuickBooks Online'), ('teller', 'Bank & card feed (Teller)'),
                          ('exa', 'Exa search'), ('tavily', 'Tavily search'),
                          ('firecrawl', 'Firecrawl'), ('reader', 'Jina Reader'),
                          ('gemini_stt', 'Google Gemini transcription'), ('groq_stt', 'Groq (Whisper)'), ('openai_stt', 'OpenAI transcription'), ('deepgram', 'Deepgram'),
@@ -499,6 +504,16 @@ class SQLiteStore:
                     txt = f.read_text(encoding='utf-8')
                     self.cx.execute('INSERT OR IGNORE INTO doc (Name, Content, UpdatedBy, UpdatedAt) VALUES (?,?,?,?)',
                                     (name, txt, 'template', _now()))
+                    # SOUL is the safety constitution every prompt is stacked on. An old UI/test
+                    # path could save it as an empty edited document, which disabled the shipped
+                    # boundaries forever because edited docs correctly stop following templates.
+                    # Empty carries no owner intent to preserve: restore the complete default, and
+                    # let the interview replace it only after the owner actually answers.
+                    # ...and not only SOUL: CODER.md went blank on a live install (2026-09-01) and
+                    # every coder session ran with no rules until somebody looked. Empty is empty.
+                    self.cx.execute("UPDATE doc SET Content=?, UpdatedBy='template', UpdatedAt=? "
+                                    "WHERE Name=? AND TRIM(IFNULL(Content,''))=''",
+                                    (txt, _now(), name))
                     # a doc NOBODY ever touched keeps tracking the shipped template, so template
                     # improvements reach existing installs - the first edit (owner or machine)
                     # changes UpdatedBy and makes the document theirs, never overwritten again
@@ -1119,8 +1134,9 @@ class SQLiteStore:
     def add_review(self, fields): return self._insert('review', fields, REVIEW_COLS, {'CreatedAt': _now()})
     def get_review(self, rid): return self._one('SELECT * FROM review WHERE ReviewId=?', (rid,))
     def list_reviews(self, status=None):
-        q = f'''SELECT rv.*, t.Title, m.Subject, m.FromName, m.FromEmail,
-                       m.Channel, m.SourceName, m.ConversationId {_REVIEW_FROM}
+        # the inbound text rides along: the queue shows what they wrote above what we would say back
+        q = f'''SELECT rv.*, t.Title, m.Subject, m.FromName, m.FromEmail, m.SentAt,
+                       m.Channel, m.SourceName, m.ConversationId, substr(m.BodyText, 1, 1500) Preview {_REVIEW_FROM}
                 WHERE {_NOT_ORPHAN} AND {_VISIBLE_PENDING}'''
         return self._rows(q + (' AND rv.Status=?' if status else '') + ' ORDER BY rv.ReviewId DESC', (status,) if status else ())
     def decide_review(self, rid, status, final, by, note=None):
@@ -1364,7 +1380,7 @@ class SQLiteStore:
                        t.Title, t.Status TaskStatus, t.Priority, t.Kind TaskKind, t.Tags TaskTags, {self.NEEDS_YOU} NeedsYou,
                        IFNULL(ch.n, 0) ChainSize,
                        rt.Decision, rt.Reason RouteReason,
-                       rv.ReviewId, rv.Status ReviewStatus, rv.Kind ReviewKind,
+                       rv.ReviewId, rv.Status ReviewStatus, rv.Kind ReviewKind, rv.HasDraft,
                        IFNULL(att.n, 0) Attachments,
                        {self.ANSWERED_AT} AnsweredAt
                 FROM message m
@@ -1374,7 +1390,7 @@ class SQLiteStore:
                     WHERE RouteId IN (SELECT MAX(RouteId) FROM route GROUP BY MessageId)
                 ) rt ON rt.MessageId=m.MessageId
                 LEFT JOIN (
-                    SELECT MessageId, ReviewId, Status, Kind FROM review
+                    SELECT MessageId, ReviewId, Status, Kind, CASE WHEN IFNULL(DraftText,'')<>'' THEN 1 ELSE 0 END HasDraft FROM review
                     WHERE ReviewId IN (SELECT MAX(ReviewId) FROM review GROUP BY MessageId)
                 ) rv ON rv.MessageId=m.MessageId
                 LEFT JOIN (
@@ -1423,6 +1439,9 @@ class SQLiteStore:
                 r['Working'] = live[r['TaskId']]
                 r['AgentWaiting'] = r['TaskId'] in parked
                 if r.get('ReviewStatus') != 'pending': r['NeedsYou'] = 1 if r['TaskId'] in parked else 0
+        # the SQL filter matched before live sessions were known; a row a working agent just took off
+        # you must not sit in "needs me" wearing a chip that says otherwise
+        if pending_only: rows = [r for r in rows if r.get('NeedsYou')]
         return rows
 
     def feed_tag(self, days=14, pending_only=False, channel=None, source=None):
@@ -1455,6 +1474,14 @@ class SQLiteStore:
                                     COUNT(*) N, MAX(SentAt) Last
                              FROM message WHERE ConversationId IS NOT NULL AND IFNULL(Channel,'')<>'email'
                              GROUP BY Channel, ConversationId ORDER BY Last DESC LIMIT ?""", (int(limit),))
+
+    def message_routes(self, mid: int) -> list:
+        """Every judgement ever made ABOUT THIS MESSAGE, oldest first.
+
+        list_routes is keyed on the TASK, and "not ours" deletes the task - so the one verdict the
+        owner most wants to see recorded took its own record away with it. Routes are keyed on the
+        message and outlive it."""
+        return self._rows('SELECT * FROM route WHERE MessageId=? ORDER BY RouteId', (mid,))
 
     def task_detail(self, task_id):
         t = self.get_task(task_id)
@@ -1561,7 +1588,7 @@ class SQLiteStore:
                  'was', 'will', 'has', 'but', 'all', 'our', 'your', 'their', 'its', 'any', 'out',
                  'can', 'when', 'what', 'how', 'why', 'who', 'does', 'did', 'about', 're'}
 
-    def lore_posts(self, topic=None, q=None, limit=50, sort='new') -> list:
+    def lore_posts(self, topic=None, q=None, limit=50, sort='new', status='live') -> list:
         """Ranked by HOW MANY of the query's distinctive words a post carries, not by whether it
         carries all of them. Requiring all is right for a person typing three words and wrong for
         handbook.block, which hands a whole task's text in - that found nothing at all, because no
@@ -1577,17 +1604,30 @@ class SQLiteStore:
         # params bind in TEXTUAL order across the whole statement: the score expression in SELECT,
         # then the topic in WHERE, then the score expression again in WHERE. ORDER BY uses the
         # alias, which is why it costs no third copy.
-        w = ["l.Status='live'"] + (['l.Topic=?'] if topic else []) + ([f'({score}) > 0'] if terms else [])
+        w = (["l.Status='live'"] if status == 'live' else ["l.Status<>'live'"]) + (['l.Topic=?'] if topic else []) + ([f'({score}) > 0'] if terms else [])
         p = [*like] + ([topic] if topic else []) + [*like]
         order = ('Hits DESC, ' if terms else '') + ('l.Score DESC, l.UpdatedAt DESC' if sort == 'top' or terms else 'l.UpdatedAt DESC')
         return self._rows(f'SELECT l.*, ({score}) Hits, (SELECT COUNT(*) FROM lore_comment WHERE LoreId=l.LoreId) Comments '
                           f'FROM lore l WHERE {" AND ".join(w)} ORDER BY {order} LIMIT ?', (*p, int(limit)))
-    def lore_vote(self, lid, delta: int):
-        self._exec('UPDATE lore SET Score=IFNULL(Score,0)+?, UpdatedAt=UpdatedAt WHERE LoreId=?', (int(delta), lid))
-    def lore_retire(self, lid, actor='owner'):
+    def lore_vote(self, lid, delta: int, actor: str = 'owner') -> int:
+        """One vote per voter, forum-style: voting again REPLACES your vote rather than stacking it,
+        so an agent that meets the same entry in ten sessions moves it one step, not ten. The Score
+        column is the sum, kept denormalised because lore_posts ranks on it. Returns the new score."""
+        with self.lock:
+            self.cx.execute('INSERT OR REPLACE INTO lore_vote (LoreId, Actor, Delta, At) VALUES (?,?,?,?)',
+                            (lid, str(actor or 'owner'), int(delta), _now()))
+            self.cx.execute('UPDATE lore SET Score=(SELECT IFNULL(SUM(Delta),0) FROM lore_vote WHERE LoreId=?) WHERE LoreId=?', (lid, lid))
+            self.cx.commit(); self._writes += 1
+        return int((self.lore_get(lid) or {}).get('Score') or 0)
+    def lore_votes(self, lid) -> list:
+        return self._rows('SELECT Actor, Delta, At FROM lore_vote WHERE LoreId=? ORDER BY At', (lid,))
+    def lore_retire(self, lid, actor='owner', status='retired'):
         """Wrong, or no longer true. Retired rather than deleted: the post is how somebody once
-        understood this, and a handbook that silently loses entries cannot be trusted either."""
-        self._exec("UPDATE lore SET Status='retired', UpdatedAt=? WHERE LoreId=?", (_now(), lid))
+        understood this, and a handbook that silently loses entries cannot be trusted either.
+        `status` says why: 'retired' by hand, 'downvoted' by the vote falling below zero."""
+        self._exec("UPDATE lore SET Status=?, UpdatedAt=? WHERE LoreId=?", (status, _now(), lid))
+    def lore_restore(self, lid):
+        self._exec("UPDATE lore SET Status='live', UpdatedAt=? WHERE LoreId=?", (_now(), lid))
     def lore_comments(self, lid) -> list:
         return self._rows('SELECT * FROM lore_comment WHERE LoreId=? ORDER BY CommentId', (lid,))
     def lore_comment(self, lid, body, author='owner') -> int:

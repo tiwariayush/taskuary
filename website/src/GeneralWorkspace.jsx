@@ -28,6 +28,52 @@ const initial = (messages) => (messages || []).map((m) => ({
   createdAt: m.createdAt ? new Date(String(m.createdAt).replace(" ", "T") + (String(m.createdAt).includes("Z") ? "" : "Z")) : undefined,
 }));
 
+const traceParts = (events) => {
+  const tools = new Map();
+  const progress = [];
+  let structured = false;
+  for (const event of events || []) {
+    if (event.type === "tool_call") {
+      structured = true;
+      const id = event.detail?.tool_call_id || `${event.name}-${tools.size}`;
+      const args = event.detail?.args || {};
+      tools.set(id, { type: "tool-call", toolCallId: id, toolName: event.name || "tool", args,
+        argsText: JSON.stringify(args) });
+    } else if (event.type === "tool_result") {
+      const id = event.detail?.tool_call_id || event.name;
+      const old = tools.get(id);
+      if (old) tools.set(id, { ...old, result: { output: event.detail?.result || "" },
+        isError: !!event.detail?.is_error });
+    } else if (event.type === "start") {
+      progress.push(`Started ${event.session?.provider || "the selected agent"}`);
+    } else if (event.type === "progress" && event.detail) {
+      structured = true; progress.push(String(event.detail));
+    } else if (event.type === "live" && !structured && event.detail) {
+      progress.push(String(event.detail));
+    } else if (event.type === "error") {
+      progress.push(`⚠ ${event.detail?.result || "The assistant could not answer."}`);
+    }
+  }
+  return [...tools.values(), ...(progress.length ? [{ type: "reasoning", text: progress.join("\n\n") }] : [])];
+};
+
+// assistant-ui owns the response being streamed in the currently mounted pane. The task's
+// session owns it when this pane is not mounted. Rehydrate that same tool/progress trace when a
+// user switches back, and attach it to the filed answer once the run is complete.
+export const messagesWithTrace = (messages, session) => {
+  const out = (messages || []).map((m) => ({ ...m, content: [...(m.content || [])] }));
+  const parts = traceParts(session?.trace);
+  if (!parts.length) return out;
+  if (session?.busy) {
+    out.push({ id: `live-${session.sid}-${session.trace_revision || 0}`, role: "assistant", content: parts });
+    return out;
+  }
+  for (let i = out.length - 1; i >= 0; i -= 1) {
+    if (out[i].role === "assistant") { out[i].content = [...parts, ...out[i].content]; break; }
+  }
+  return out;
+};
+
 const AssistantText = ({ text }) => <Md text={text} />;
 const AssistantReasoning = ({ text }) => text ? (
   <details className="tq-aui-progress" open>
@@ -95,8 +141,9 @@ function AssistantThread({ task, messages, onAsked, onStop, selectionRef, attach
             argsText: JSON.stringify(args) });
           yield { content: content() };
         } else if (event.type === "tool_result") {
-          const old = tools.get(event.name);
-          if (old) tools.set(event.name, { ...old, result: { output: event.detail?.result || "" },
+          const id = event.detail?.tool_call_id || event.name;
+          const old = tools.get(id);
+          if (old) tools.set(id, { ...old, result: { output: event.detail?.result || "" },
             isError: !!event.detail?.is_error });
           yield { content: content() };
         } else if (event.type === "start") {
@@ -206,6 +253,7 @@ export function GeneralWorkspace({ task, onSession, onOpenReports, compact = fal
   const [threadKey, setThreadKey] = useState(0);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
   const [reportBusy, setReportBusy] = useState(false);
   const fileRef = useRef(null);
   const selectionRef = useRef({ connectorId: "", model: "" });
@@ -231,7 +279,7 @@ export function GeneralWorkspace({ task, onSession, onOpenReports, compact = fal
 
   useEffect(() => {
     let live = true;
-    setData(null); setError(""); setAttachments([]);
+    setData(null); setError(""); setNotice(""); setAttachments([]);
     api.post(`/api/tasks/${task.TaskId}/assistant/session`, {}).then((r) => live && accept(r.data)).catch((e) => live && setError(errText(e)));
     return () => { live = false; };
   }, [accept, task.TaskId]);
@@ -286,20 +334,21 @@ export function GeneralWorkspace({ task, onSession, onOpenReports, compact = fal
         const { data: fresh } = await api.get(`/api/tasks/${task.TaskId}/assistant`);
         if (!live) return;
         const grew = (fresh.messages || []).length !== (data?.messages || []).length;
+        const traceChanged = fresh.session?.trace_revision !== data?.session?.trace_revision;
         setData(fresh);
-        if (grew) setThreadKey((k) => k + 1);
+        if (grew || traceChanged) setThreadKey((k) => k + 1);
       } catch { /* it will still be there next tick */ }
     }, 2500);
     return () => { live = false; clearInterval(timer); };
   }, [busy, task.TaskId, data?.messages]);
   const makeReport = async () => {
-    setError(""); setReportBusy(true);
+    setError(""); setNotice(""); setReportBusy(true);
     try {
       const { data: made } = await api.post(`/api/tasks/${task.TaskId}/assistant/report`, {
         pick: connectorId || null, model: model || null,
       });
       if (onOpenReports) onOpenReports(made.sourceId);
-      else setError(`Created “${made.title}” in Reports.`);
+      else setNotice(`Created “${made.title}” in Reports.`);
     } catch (e) { setError(errText(e)); }
     finally { setReportBusy(false); }
   };
@@ -310,6 +359,7 @@ export function GeneralWorkspace({ task, onSession, onOpenReports, compact = fal
 
   if (!data && !error) return <Box sx={{ height: 520, display: "grid", placeItems: "center" }}><CircularProgress size={22} /></Box>;
   const session = data?.session;
+  const shownMessages = messagesWithTrace(data?.messages, session);
   return (
     <Box onPaste={pasted} sx={{ border: `1px solid ${BORDER}`, borderRadius: 1.75, overflow: "hidden", bgcolor: PANEL2,
       minHeight: 0, display: "flex", flexDirection: "column",
@@ -317,30 +367,31 @@ export function GeneralWorkspace({ task, onSession, onOpenReports, compact = fal
       <Box sx={{ minHeight: 39, px: 1.25, display: "flex", alignItems: "center", gap: 0.8, borderBottom: `1px solid ${BORDER}`, bgcolor: PANEL,
         overflowX: "auto", flexShrink: 0 }}>
         <Box sx={{ width: 7, height: 7, borderRadius: 99, bgcolor: session?.alive ? "#78a17b" : "#c7a258" }} />
-        <Typography sx={{ ...mono, fontSize: 10.5, letterSpacing: ".13em", textTransform: "uppercase", color: DIM }}>assistant workspace</Typography>
-        <Box sx={{ flex: 1 }} />
+        <Typography noWrap sx={{ ...mono, fontSize: 10.5, letterSpacing: ".13em", textTransform: "uppercase", color: DIM, flexShrink: 0 }}>assistant workspace</Typography>
+        <Box sx={{ flex: 1, minWidth: 8 }} />
         <Select size="small" value={connectorId} displayEmpty onChange={(e) => {
           const provider = data?.providers?.find((p) => String(p.id) === String(e.target.value));
           updateProvider(e.target.value, provider?.model || "");
         }}
-          sx={{ height: 27, fontSize: 11.5, minWidth: 130, bgcolor: PANEL2 }}>
+          sx={{ height: 27, fontSize: 11.5, minWidth: 130, bgcolor: PANEL2, flexShrink: 0 }}>
           {!data?.providers?.length && <MenuItem value="">No agent connected</MenuItem>}
           {(data?.providers || []).map((p) => <MenuItem key={p.id} value={String(p.id)}>{p.label}</MenuItem>)}
         </Select>
         <TextField size="small" value={model} placeholder="provider default" onChange={(e) => setModel(e.target.value)}
-          onBlur={() => connectorId && updateProvider(connectorId, model)} sx={{ width: 150, "& input": { py: 0.55, fontSize: 11.5 } }} />
+          onBlur={() => connectorId && updateProvider(connectorId, model)} sx={{ width: 150, flexShrink: 0, "& input": { py: 0.55, fontSize: 11.5 } }} />
         <Button size="small" startIcon={<ViewDayIcon sx={{ fontSize: 14 }} />} variant={view === "assistant" ? "contained" : "text"}
           title="The conversation. What the assistant is doing shows here as it works."
-          onClick={() => chooseView("assistant")} sx={{ minWidth: 0, fontSize: 11 }}>Assistant</Button>
+          onClick={() => chooseView("assistant")} sx={{ minWidth: 0, fontSize: 11, flexShrink: 0 }}>Assistant</Button>
         <Button size="small" startIcon={<TerminalIcon sx={{ fontSize: 14 }} />} variant={view === "terminal" ? "contained" : "text"}
           title="The same conversation as raw session output - what the CLI actually printed."
-          onClick={() => chooseView("terminal")} sx={{ minWidth: 0, fontSize: 11 }}>Terminal</Button>
+          onClick={() => chooseView("terminal")} sx={{ minWidth: 0, fontSize: 11, flexShrink: 0 }}>Terminal</Button>
         {/* what it is ALLOWED to state as fact about our own numbers - the chat teaches it, this shows it */}
         <Button size="small" startIcon={<FunctionsIcon sx={{ fontSize: 14 }} />} variant={view === "numbers" ? "contained" : "text"}
           title="Certified numbers: the figures this assistant is allowed to state as fact about your own systems, because each was proved against numbers you already knew. Teach it one by asking for a figure it does not have yet."
-          onClick={() => chooseView("numbers")} sx={{ minWidth: 0, fontSize: 11 }}>Numbers</Button>
+          onClick={() => chooseView("numbers")} sx={{ minWidth: 0, fontSize: 11, flexShrink: 0 }}>Numbers</Button>
       </Box>
       {error && <Alert severity="error" sx={{ borderRadius: 0, py: 0 }}>{error}</Alert>}
+      {notice && <Alert severity="success" onClose={() => setNotice("")} sx={{ borderRadius: 0, py: 0 }}>{notice}</Alert>}
       {busy && (
         <Box sx={{ display: "flex", alignItems: "center", gap: 1, px: 1.25, py: 0.5, bgcolor: PANEL2,
           borderBottom: `1px solid ${BORDER}` }}>
@@ -350,7 +401,7 @@ export function GeneralWorkspace({ task, onSession, onOpenReports, compact = fal
           </Typography>
         </Box>
       )}
-      {!data?.providers?.length && <Alert severity="info" sx={{ borderRadius: 0, py: 0 }}>Add a CLI agent in Settings to run this work. API providers are optional.</Alert>}
+      {!data?.providers?.length && <Alert severity="info" sx={{ borderRadius: 0, py: 0 }}>Add a CLI agent under Connections → AI CLI agents to run this work. API providers are optional.</Alert>}
       <input ref={fileRef} hidden type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple onChange={(e) => upload(e.target.files)} />
       {uploading && <Box sx={{ px: 1, py: 0.5, color: FAINT, fontSize: 11 }}>Attaching image…</Box>}
       <Box sx={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
@@ -360,7 +411,7 @@ export function GeneralWorkspace({ task, onSession, onOpenReports, compact = fal
           <TerminalPane sid={session.sid} height="100%" />
         ) : session ? (
           <SessionPane sid={session.sid} height="100%">
-            <AssistantThread key={`${task.TaskId}-${threadKey}`} task={task} messages={data.messages}
+            <AssistantThread key={`${task.TaskId}-${threadKey}`} task={task} messages={shownMessages}
               onAsked={dropAsk} onStop={stopRun} selectionRef={selectionRef}
               attachmentsRef={attachmentsRef} onSent={sent} onClearAttachments={clearAttachments}
               onAttach={() => fileRef.current?.click()} onReport={makeReport} reportBusy={reportBusy} />

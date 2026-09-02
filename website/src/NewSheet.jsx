@@ -9,7 +9,7 @@
 // assistant's own chat. All of them land on the Timeline at the minute the button was
 // pressed. Nothing here sends: "Send something" produces a DRAFT the owner approves, which is
 // the one send path the app has and the only one that respects the per-channel reply switches.
-import React, { useCallback, useEffect, useState } from "react";
+import React, { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
 import {
   Alert, Box, Button, CircularProgress, Dialog, DialogContent, DialogTitle, IconButton,
   MenuItem, Select, TextField, Typography,
@@ -19,6 +19,8 @@ import api from "./api";
 import { ACCENT, ACCENT2, BORDER, DIM, FAINT, GRADIENT, INK, PANEL, PANEL2, ROLES, mono } from "./theme.jsx";
 import { ChannelIcon, AgentPicker, useAgents, TaskuaryMark } from "./ui.jsx";
 import { NO_REPO, planTask } from "./newTask.js";
+import FormControlLabel from "@mui/material/FormControlLabel";
+import Checkbox from "@mui/material/Checkbox";
 
 const KINDS = [
   { key: "send",   mark: "✉️", label: "Send something", hint: "a message you start, drafted in your voice and approved by you" },
@@ -42,6 +44,31 @@ const Fork = ({ on, title, hint, onClick }) => (
   </Box>
 );
 
+// Keep the large freeform field below its own render boundary. The sheet contains provider
+// discovery, menus, forks, and a MUI dialog; owning this value at the sheet level rebuilt all of
+// that on every keystroke and made an ordinary sentence feel like terminal input over a slow
+// connection. The parent only hears when empty/non-empty changes and reads the value on submit.
+const AboutField = React.memo(forwardRef(function AboutField({ kind, how, onReady }, ref) {
+  const [value, setValue] = useState("");
+  const ready = useRef(false);
+  useImperativeHandle(ref, () => ({ value, clear: () => { ready.current = false; setValue(""); } }), [value]);
+  const changed = (e) => {
+    const next = e.target.value;
+    setValue(next);
+    const hasText = !!next.trim();
+    if (hasText !== ready.current) { ready.current = hasText; onReady(hasText); }
+  };
+  return (
+    <TextField fullWidth multiline minRows={kind === "note" ? 2 : 3} value={value} autoFocus
+      onChange={changed}
+      placeholder={kind === "send" ? "the census numbers he asked for, plus why Ashgrove moved"
+        : kind === "agent" ? (how === "chat" ? "why did Riverbend's census move four points in July?"
+          : "work out why the nightly export drops the last facility")
+        : "chase the Ashgrove AP replacement"}
+      sx={{ "& .MuiInputBase-root": { fontSize: 13, bgcolor: "#fcfaf7" } }} />
+  );
+}));
+
 export default function NewSheet({ open, onClose, onDone, onOpenTask }) {
   const [kind, setKind] = useState("send");
   const [busy, setBusy] = useState(false);
@@ -52,7 +79,8 @@ export default function NewSheet({ open, onClose, onDone, onOpenTask }) {
   const [targets, setTargets] = useState([]);          // [{channel, to: [{to, name, hint}]}]
   const [channel, setChannel] = useState("");
   const [to, setTo] = useState("");
-  const [about, setAbout] = useState("");
+  const [hasAbout, setHasAbout] = useState(false);
+  const aboutRef = useRef(null);
   const [mode, setMode] = useState("draft");
   // agent
   const { agents, models } = useAgents();
@@ -62,6 +90,9 @@ export default function NewSheet({ open, onClose, onDone, onOpenTask }) {
   // than inferred from the words: a question landing in a terminal by ACCIDENT is exactly what
   // newTask.planTask exists to stop, and it will not guess for us.
   const [how, setHow] = useState("terminal");
+  // A session you open here is usually one you mean to sit in, so it does not end itself: the
+  // judge that closes a router's task on a quiet screen would close this one while you read it.
+  const [stayOpen, setStayOpen] = useState(true);
   // note
   const [when, setWhen] = useState("");
 
@@ -81,19 +112,20 @@ export default function NewSheet({ open, onClose, onDone, onOpenTask }) {
 
   const submit = useCallback(async () => {
     setBusy(true); setErr(""); setOk("");
+    const about = String(aboutRef.current?.value || "").trim();
     try {
       if (kind === "send") {
-        const { data } = await api.post("/api/outbox", { channel, to: to.trim(), about: about.trim(), mode });
+        const { data } = await api.post("/api/outbox", { channel, to: to.trim(), about, mode });
         setOk(mode === "task"
           ? `${data.ref} — an agent is finding out first; the message is drafted when it is done.`
           : `${data.ref} — drafted. It is on the Timeline waiting for you to send it.`);
-        setAbout(""); onDone?.(); onOpenTask?.(data.taskId);
+        aboutRef.current?.clear(); setHasAbout(false); onDone?.(); onOpenTask?.(data.taskId);
       } else if (kind === "agent") {
         // one module decides chat-vs-terminal for the whole app, so the Board and this sheet can
         // never disagree about what "no repository" means
         const chat = how === "chat";
-        const plan = planTask(chat ? NO_REPO : null, chat ? "live" : "terminal");
-        const { data } = await api.post("/api/tasks", { Title: about.trim().slice(0, 300), Summary: about.trim(),
+        const plan = planTask(chat ? NO_REPO : null, chat ? "live" : "terminal", false, !chat && stayOpen);
+        const { data } = await api.post("/api/tasks", { Title: about.slice(0, 300), Summary: about,
           Kind: plan.kind, Tags: plan.tags });
         if (plan.chat) {
           // nothing to dispatch: the chat opens its own session and asks the question off the tag
@@ -103,17 +135,17 @@ export default function NewSheet({ open, onClose, onDone, onOpenTask }) {
           await api.post(`/api/tasks/${data.taskId}/dispatch`, { agent, model: model || null });
           setOk(`${data.ref} — ${agent} is on it in a live session.`);
         }
-        setAbout(""); onDone?.(); onOpenTask?.(data.taskId);
+        aboutRef.current?.clear(); setHasAbout(false); onDone?.(); onOpenTask?.(data.taskId);
       } else {
-        const { data } = await api.post("/api/notes", { title: about.trim().slice(0, 300), body: "", when: when || null });
+        const { data } = await api.post("/api/notes", { title: about.slice(0, 300), body: "", when: when || null });
         setOk(`Noted — it sits on ${String(data.at).slice(0, 16)} and nothing will touch it.`);
-        setAbout(""); setWhen(""); onDone?.();
+        aboutRef.current?.clear(); setHasAbout(false); setWhen(""); onDone?.();
       }
     } catch (e) { setErr(e?.response?.data?.detail || "That did not go through"); }
     setBusy(false);
-  }, [kind, channel, to, about, mode, how, agent, model, when, onDone, onOpenTask]);
+  }, [kind, channel, to, mode, how, agent, model, when, onDone, onOpenTask]);
 
-  const canGo = about.trim() && (kind !== "send" || (channel && to.trim()));
+  const canGo = hasAbout && (kind !== "send" || (channel && to.trim()));
   const verb = kind === "send" ? (mode === "task" ? "Send an agent" : "Draft it")
     : kind === "agent" ? (how === "chat" ? "Ask the assistant" : "Start the session") : "Note it";
 
@@ -210,6 +242,19 @@ export default function NewSheet({ open, onClose, onDone, onOpenTask }) {
                     It picks the checkout from what you write — name the system if there is any doubt.
                   </Typography>
                 </Box>
+                {/* the difference between a session that works FOR you and one you work IN */}
+                <FormControlLabel sx={{ mt: 0.5, ml: 0, alignItems: "flex-start" }}
+                  control={<Checkbox size="small" checked={stayOpen} sx={{ py: 0.25, mr: 0.5 }}
+                    onChange={(x) => setStayOpen(x.target.checked)} />}
+                  label={
+                    <Box sx={{ pt: 0.35 }}>
+                      <Typography sx={{ fontSize: 12.5, fontWeight: 600, color: INK }}>Leave it open when it goes quiet</Typography>
+                      <Typography sx={{ fontSize: 11, color: FAINT, lineHeight: 1.5 }}>
+                        For a session you mean to sit in. Off, it closes itself the moment it reads
+                        as finished — which is right for work that arrived, and wrong while you are
+                        still typing. Even the agent's own `taskuary --done` only tells you it thinks it is finished.
+                      </Typography>
+                    </Box>} />
               </Box>
             )}
           </>
@@ -219,13 +264,7 @@ export default function NewSheet({ open, onClose, onDone, onOpenTask }) {
           <Label>{kind === "send" ? "What's this about"
             : kind === "agent" ? (how === "chat" ? "What do you want to work out" : "What should it do")
             : "What do you want to remember"}</Label>
-          <TextField fullWidth multiline minRows={kind === "note" ? 2 : 3} value={about} autoFocus
-            onChange={(e) => setAbout(e.target.value)}
-            placeholder={kind === "send" ? "the census numbers he asked for, plus why Ashgrove moved"
-              : kind === "agent" ? (how === "chat" ? "why did Riverbend's census move four points in July?"
-                : "work out why the nightly export drops the last facility")
-              : "chase the Ashgrove AP replacement"}
-            sx={{ "& .MuiInputBase-root": { fontSize: 13, bgcolor: "#fcfaf7" } }} />
+          <AboutField ref={aboutRef} kind={kind} how={how} onReady={setHasAbout} />
           {kind === "send" && (
             <Typography variant="caption" sx={{ color: FAINT, display: "block", mt: 0.75 }}>
               Shorthand is fine — this is what you are telling the drafter, not what they read.

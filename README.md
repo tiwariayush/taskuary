@@ -1,7 +1,7 @@
 # Taskuary
 
 [![CI](https://github.com/ldbumble/taskuary/actions/workflows/ci.yml/badge.svg)](https://github.com/ldbumble/taskuary/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/taskuary.svg)](https://pypi.org/project/taskuary/)
+[![PyPI](https://img.shields.io/pypi/v/taskuary.svg?cacheSeconds=600)](https://pypi.org/project/taskuary/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776ab.svg)](https://github.com/ldbumble/taskuary)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -13,7 +13,7 @@ and replies wait for your approval. Nothing sends or ships without you.
 
 ![The Taskuary Studio: work arrives, triage decides what needs action, and agents take seats to work it.](https://raw.githubusercontent.com/ldbumble/taskuary/master/docs/hero.gif)
 
-Taskuary is early—currently **v0.3.2.3**—and moving fast. The funnel, review queue,
+Taskuary is early—currently **v0.3.2.4**—and moving fast. The funnel, review queue,
 agent sessions, and reports pipeline are in daily use; breaking changes are still possible
 before 1.0.
 

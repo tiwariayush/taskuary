@@ -15,7 +15,7 @@ PLANNED = ['graphql', 'smb_file',
            # systems of record. Intacct is BUILT (see run_intacct); the rest are named because
            # the category is the question people arrive with - "does this reach our ERP / our
            # EMR" - and an empty Corporate systems group answers that worse than a list does.
-           'netsuite', 'quickbooks', 'sap', 'workday', 'adp',
+           'netsuite', 'sap', 'workday', 'adp',            # quickbooks is BUILT (quickbooks.py)
            'epic', 'cerner', 'pointclickcare']   # smb_file is a NETWORK
 # share and still planned; a path on this machine is local_file and works now
 
@@ -488,6 +488,14 @@ REGISTRY = {'sqlite': run_sqlite, 'mssql': run_mssql, 'database': run_database,
             'prometheus': run_prometheus, 'datadog': run_datadog,
             'winrm': run_winrm, 'mcp': run_mcp, 'rest': run_rest,
             'intacct': run_intacct, 'intacct_fields': run_intacct_fields,
+            # QuickBooks Online: three reads, and the first two WRITES a Corporate system has here -
+            # a bill and a paid expense, gated by the card's scope (proposals below write)
+            'quickbooks': _lazy('quickbooks', 'run_quickbooks'), 'quickbooks_vendors': _lazy('quickbooks', 'run_quickbooks_vendors'),
+            'quickbooks_accounts': _lazy('quickbooks', 'run_quickbooks_accounts'),
+            'quickbooks_bill': _lazy('quickbooks', 'run_quickbooks_bill'), 'quickbooks_expense': _lazy('quickbooks', 'run_quickbooks_expense'),
+            # the bank and card feed (teller.py): where a transaction comes from before it becomes a bill
+            'teller_accounts': _lazy('teller', 'run_teller_accounts'), 'teller_transactions': _lazy('teller', 'run_teller_transactions'),
+            'teller_balances': _lazy('teller', 'run_teller_balances'),
             # the semantic layer over the ERP: a number that was PROVED, and the check that keeps it proved
             'metric': run_metric, 'metric_check': run_metric_check,
             'rss': run_rss, 'digest': run_digest, 'automate': run_automate, 'assistant': run_assistant,
@@ -499,6 +507,7 @@ REGISTRY = {'sqlite': run_sqlite, 'mssql': run_mssql, 'database': run_database,
             # the knowledge base: documents indexed in this store (knowledge.py) - searched, and refreshed on a schedule
             'kb_search': _lazy('knowledge', 'run_kb_search'), 'kb_reindex': _lazy('knowledge', 'run_kb_reindex'),
             'handbook_search': _lazy('handbook', 'run_handbook_search'), 'handbook_write': _lazy('handbook', 'run_handbook_write'),
+            'handbook_vote': _lazy('handbook', 'run_handbook_vote'),
             **{n: _planned(n) for n in PLANNED}}
 
 # Which connector CARD owns each executor type: the s3/cloudwatch types run on the aws
@@ -506,8 +515,10 @@ REGISTRY = {'sqlite': run_sqlite, 'mssql': run_mssql, 'database': run_database,
 CARD_OF = {'s3_object': 'aws', 'cloudwatch_logs': 'aws', 'azure_blob': 'azure', 'azure_logs': 'azure', 'calendar': 'outlook',
            'entra_users': 'azure', 'entra_groups': 'azure', 'entra_signins': 'azure', 'entra_licenses': 'azure',
            'intacct_fields': 'intacct', 'sharepoint_list': 'sharepoint', 'sharepoint_file': 'sharepoint',
+           'quickbooks_vendors': 'quickbooks', 'quickbooks_accounts': 'quickbooks', 'quickbooks_bill': 'quickbooks', 'quickbooks_expense': 'quickbooks',
+           'teller_accounts': 'teller', 'teller_transactions': 'teller', 'teller_balances': 'teller',
            'kb_search': 'knowledge', 'kb_reindex': 'knowledge',
-           'handbook_search': 'handbook', 'handbook_write': 'handbook'}
+           'handbook_search': 'handbook', 'handbook_write': 'handbook', 'handbook_vote': 'handbook'}
 
 def card_of(t): return CARD_OF.get(t, t)
 
@@ -573,6 +584,16 @@ def intacct_connection(store, connector_id=None) -> dict:
     return _card(store, 'intacct', 'user_password', connector_id)
 
 
+def _teller_connection(store, connector_id=None) -> dict:
+    from .teller import connection
+    return connection(store, connector_id)
+
+
+def _quickbooks_connection(store, connector_id=None) -> dict:
+    from .quickbooks import connection
+    return connection(store, connector_id)
+
+
 def prometheus_connection(store, connector_id=None) -> dict:
     """base_url (+ optional bearer token as the write-only secret) lives on the card."""
     return _card(store, 'prometheus', 'token', connector_id)
@@ -607,6 +628,8 @@ CONNECTION_OF = {'mssql': mssql_connection, 'winrm': winrm_connection, 'database
                  'entra_signins': azure_connection, 'entra_licenses': azure_connection,
                  'prometheus': prometheus_connection, 'datadog': datadog_connection,
                  'intacct': intacct_connection, 'intacct_fields': intacct_connection,
+                 **{t: _quickbooks_connection for t in ('quickbooks', 'quickbooks_vendors', 'quickbooks_accounts', 'quickbooks_bill', 'quickbooks_expense')},
+                 **{t: _teller_connection for t in ('teller_accounts', 'teller_transactions', 'teller_balances')},
                  # both borrow: SharePoint the Outlook tenant app, Sheets the Gmail card's Google client
                  'sharepoint_list': _sharepoint_connection, 'sharepoint_file': _sharepoint_connection,
                  'google_sheets': _sheets_connection}

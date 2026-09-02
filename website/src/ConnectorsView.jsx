@@ -487,6 +487,38 @@ const DATA_META = {
       "Test logs in for real and then tries to READ \u2014 a green card that only proves the password works hides the usual failure, which is a role with permission on nothing.",
       "Build the reports on the REPORTS tab: name an object (GLENTRY, APBILL, VENDOR, GLACCOUNT\u2026), the fields you want and any filters. Nobody remembers the field ids: the source card's 'What fields does APBILL have?' asks Sage itself and lists them, custom fields included, and the same lookup is a report in its own right when you want to hear about a new one.",
       "Or just say what you want in English: at the top of the Reports tab for a whole report, or on any source card for that one card. Either way it reads the object's real field list before writing the query."] },
+  quickbooks: { title: "QuickBooks Online", types: ["quickbooks", "quickbooks_vendors", "quickbooks_accounts", "quickbooks_bill", "quickbooks_expense"],
+    fields: [["Intuit app client id (developer.intuit.com → your app → Keys & credentials)", "client_id"],
+      ["Intuit app client secret", "client_secret"],
+      ["environment — production, or sandbox for a test company", "env", "production"],
+      ["company (realm) id — filled in by Connect", "realm_id"]],
+    secretLabel: "refresh token (write-only) — Connect fills it in; it rotates on every use and is saved back each time",
+    desc: "The books: bills, purchases, vendors and the chart of accounts as reports and agent tools — and the first system here an agent can POST to, on your approval: an AP bill or a paid expense.",
+    connect: { label: "Connect to QuickBooks", status: (cid) => `/api/connectors/${cid}/quickbooks/status`, start: (cid) => `/api/connectors/${cid}/quickbooks/authorize`,
+      text: "Opens Intuit's sign-in in a new tab. Pick the company; the token lands on this card and never reaches the browser." },
+    howto: ["developer.intuit.com → Dashboard → Create an app → QuickBooks Online and Payments → scope Accounting. Keys & credentials has a Development (sandbox) and a Production tab — production keys need the app's short questionnaire; sandbox keys work the same day against Intuit's test company.",
+      "On that same page add the REDIRECT URI shown on this card (http://localhost:<port>/api/quickbooks/callback) — Intuit refuses a sign-in whose redirect is not registered, character for character.",
+      "Paste the client id and secret here, choose production or sandbox, Save, then Connect to QuickBooks: Intuit's sign-in opens, you pick the company, and the browser comes back to Taskuary with the token. Test reads the company name and a vendor list.",
+      "Reads (queries, vendors, accounts) run at the card's default scope. The two WRITES — a bill, a paid expense — need scope write on this card; below that an agent can only PROPOSE one, which lands in Review with the vendor, amount and account, and approving it posts it. That is the design: nothing reaches the books without a click until you say otherwise.",
+      "Build the reports on the REPORTS tab: 'QuickBooks Online' with a query in QBO's SQL (SELECT * FROM Bill WHERE TxnDate >= '2026-08-01'), or the vendor / account lists as their own reports."],
+    agent: ["GET {base}/api/connectors/{cid}/quickbooks/status{hdr}: has_app says whether the Intuit keys are saved; connected says whether a token is. Neither is yours to make - the owner creates the app at developer.intuit.com and presses Connect (a browser sign-in). Ask for the client id and secret, save them in ConfigJson, tell them the redirect URI from status to register, then ask them to press Connect on the card.",
+      "Once connected, POST {base}/api/connectors/{cid}/test{hdr}. A 401 in the detail means the refresh token expired (100 days unused) - the owner presses Connect again.",
+      "Never post a bill or an expense yourself: propose it (TASKUARY-PROPOSE {\"action\": \"run_tool\", \"type\": \"quickbooks_bill\", \"vendor\": ..., \"amount\": ..., \"account\": ..., \"doc_number\": ...}) and say in the session what it is for. Turn the card on, SETUP DONE."] },
+  teller: { title: "Bank & card feed (Teller)", types: ["teller_accounts", "teller_transactions", "teller_balances"],
+    fields: [["Teller application id (teller.io → your application)", "application_id"],
+      ["environment — sandbox, development (free, real banks, 100 logins) or production", "environment", "sandbox"],
+      ["client certificate path (.pem) — development and production only", "cert_path", "C:/taskuary/teller/certificate.pem"],
+      ["private key path (.pem) — development and production only", "key_path", "C:/taskuary/teller/private_key.pem"]],
+    secretLabel: "access token (write-only) — Connect a bank fills it in",
+    desc: "What left the bank and the cards, as rows: every account under one bank login, its transactions newest first, its balances. Read-only by construction — a feed cannot move money. Schedule the transactions with 'can become work' and each new one is a message triage judges.",
+    connect: { widget: "teller", label: "Connect a bank", status: (cid) => `/api/connectors/${cid}/teller/status`, enroll: (cid) => `/api/connectors/${cid}/teller/enroll`,
+      text: "Opens the bank's own sign-in (Teller Connect). The token for that login lands on this card; the browser never keeps it." },
+    howto: ["teller.io → sign up → create an application. The dashboard hands you an application id and, for development and production, a certificate.pem and private_key.pem — save both somewhere on this machine and put their paths on the card. Sandbox needs no certificate and accepts any login at its fake banks, which is how to try the loop first.",
+      "Paste the application id, pick the environment, Save, then Connect a bank: the bank's sign-in opens in a modal, you sign in, and the access token for that login lands on this card. One card is one bank login - Add another for a second bank.",
+      "Test lists the accounts under the login. Build the reports on the REPORTS tab: 'Bank & card — transactions' for one account (its last four digits) or all of them, so many days back; switch on 'can become work (triage decides)' and every new transaction arrives as a message - the front door of the card-to-books playbook (docs/beyond-code.md).",
+      "The development environment is free up to 100 bank logins; production is the same code with production keys and Teller's pricing."],
+    agent: ["GET {base}/api/connectors/{cid}/teller/status{hdr}: has_app says whether the application id is saved, connected whether a token is. Neither is yours to make - the owner signs up at teller.io and signs in at their bank through Connect a bank on the card. Ask for the application id and the certificate paths, save them in ConfigJson, then ask them to press Connect a bank.",
+      "Once connected, POST {base}/api/connectors/{cid}/test{hdr}. A 403 means the certificate does not match the application or the token belongs to another environment. Turn the card on, SETUP DONE."] },
   prometheus: { title: "Prometheus", types: ["prometheus"],
     fields: [["base URL", "base_url", "http://prometheus.yourcompany.local:9090"]],
     secretLabel: "bearer token (optional — most Prometheus servers need none)",
@@ -711,12 +743,12 @@ const PLANNED_TITLES = { google_sheets: "Google Sheets", sharepoint_list: "Share
   smb_file: "Network file share", local_file: "File on this computer", graphql: "GraphQL",
   sqlite: "SQLite", gcp: "Google Cloud", kubernetes: "Kubernetes", grafana: "Grafana",
   elastic: "Elasticsearch", perplexity: "Perplexity", serpapi: "SerpAPI", browserbase: "Browserbase",
-  netsuite: "NetSuite", quickbooks: "QuickBooks", sap: "SAP", workday: "Workday", adp: "ADP",
+  netsuite: "NetSuite", sap: "SAP", workday: "Workday", adp: "ADP",
   epic: "Epic (EMR)", cerner: "Oracle Cerner (EMR)", pointclickcare: "PointClickCare (EMR)" };
 const KNOWN_PLANNED = [];
 const PLACED = new Set(["graphql", "sqlite", "gcp", "kubernetes", "grafana", "elastic",
   "perplexity", "serpapi", "browserbase", "google_sheets", "sharepoint_list", "smb_file", "local_file",
-  "netsuite", "quickbooks", "sap", "workday", "adp", "epic", "cerner", "pointclickcare"]);
+  "netsuite", "sap", "workday", "adp", "epic", "cerner", "pointclickcare"]);
 
 const VoiceVocabulary = ({ onBack }) => {
   const [text, setText] = useState("");
@@ -951,7 +983,7 @@ export default function ConnectorsView() {
       ...catalogCards("Cloud & infrastructure"),
     ]},
     { title: "Corporate systems", cards: [
-      ...dataCards(["intacct"]),
+      ...dataCards(["intacct", "quickbooks", "teller"]),
       ...catalogCards("Corporate systems"),
     ]},
     { title: "Observability", cards: [...dataCards(["prometheus", "datadog"]), ...catalogCards("Observability")] },
@@ -968,7 +1000,7 @@ export default function ConnectorsView() {
 
   return (
     <SideRail title="Connections" q={q} setQ={setQ}
-      placeholder="Search connectors — Slack, SQL Server…"
+      placeholder="Search connectors…"
       items={groups.map((g) => ({ key: g.title, label: g.title, n: g.cards.length || null }))}
       value={group} onChange={setGroup}
       note="Keys and connection settings are stored locally, in the same SQLite file as your tasks.">
@@ -1399,7 +1431,7 @@ function ChannelDetail({ conn, sources, reload, onBack, onCreated }) {
         <Stepper nonLinear activeStep={step} orientation="vertical" sx={{ "& .MuiStepLabel-label": { fontSize: 13.5, fontWeight: 600 } }}>
           {steps.map((s, i) => (
             <Step key={s.label} completed={s.done}>
-              <StepButton onClick={() => setStep(i)}>{s.label}{s.done ? " ✓" : ""}</StepButton>
+              <StepButton onClick={() => setStep(i)}>{s.label}</StepButton>
               <StepContent>{s.body}</StepContent>
             </Step>
           ))}
@@ -1710,6 +1742,67 @@ function CloudObjects({ conn, meta, objects, reload }) {
 
 /* ── shared detail for the DATA_META cards (database / aws / azure): fields + write-only
    secret + live Test; the connection only - reports are built on the Reports tab. ── */
+/* A card whose credential is minted by signing in at the provider (QuickBooks): the box says
+   what the provider's app must carry (the redirect URI), whether we are connected and to which
+   company, and one button that opens the sign-in. The token comes back server-side. */
+function OAuthConnect({ conn, meta, reload }) {
+  const [st, setSt] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const load = useCallback(async () => { try { setSt((await api.get(meta.connect.status(conn.ConnectorId))).data); } catch { /* the card still works */ } }, [conn.ConnectorId, meta]);
+  useEffect(() => { load(); }, [load]);
+  // the sign-in happens in another tab; poll while it is likely underway so the box flips to
+  // "connected" without a refresh
+  useEffect(() => { if (!busy) return undefined; const id = setInterval(load, 3000); const stop = setTimeout(() => setBusy(false), 180000); return () => { clearInterval(id); clearTimeout(stop); }; }, [busy, load]);
+  useEffect(() => { if (st?.connected) setBusy(false); }, [st?.connected]);
+  // Teller Connect is a script on THIS page, not a redirect: it opens the bank's sign-in in a
+  // modal and calls back with the token, which goes straight to the server and nowhere else
+  const teller = async () => {
+    if (!window.TellerConnect) {
+      await new Promise((ok, no) => { const s = document.createElement("script"); s.src = st.connect_js; s.onload = ok; s.onerror = () => no(new Error("Teller Connect did not load - is cdn.teller.io reachable from here?")); document.head.appendChild(s); });
+    }
+    setBusy(true);
+    const tc = window.TellerConnect.setup({
+      applicationId: st.application_id, environment: st.environment, products: ["transactions", "balance"],
+      onSuccess: async (enr) => {
+        try {
+          await api.post(meta.connect.enroll(conn.ConnectorId), { access_token: enr.accessToken, enrollment_id: enr.enrollment?.id, institution: enr.enrollment?.institution?.name });
+          await load(); reload();
+        } catch (e) { setErr(e?.response?.data?.detail || "the token did not save"); }
+        setBusy(false);
+      },
+      onExit: () => setBusy(false),
+    });
+    tc.open();
+  };
+  const go = async () => {
+    setErr("");
+    try {
+      if (meta.connect.widget === "teller") return await teller();
+      const { data } = await api.get(meta.connect.start(conn.ConnectorId)); window.open(data.url, "_blank", "noopener"); setBusy(true);
+    } catch (e) { setErr(e?.response?.data?.detail || e?.message || "could not start the sign-in"); }
+  };
+  return (
+    <Box sx={{ p: 1.5, border: `1px solid ${BORDER}`, borderRadius: 2, bgcolor: PANEL2 }}>
+      <Box sx={{ display: "flex", alignItems: "center", gap: 1, flexWrap: "wrap" }}>
+        <Button variant="contained" disableElevation disabled={!st?.has_app || busy} onClick={go}
+          title={st?.has_app ? meta.connect.text : "save the app's client id and secret first"}>
+          {busy ? <><CircularProgress size={12} sx={{ color: "#fff", mr: 1 }} /> waiting for the sign-in…</> : st?.connected ? "Reconnect" : meta.connect.label}
+        </Button>
+        {st?.connected
+          ? <Typography variant="body2" sx={{ color: "#47654a", fontWeight: 600 }}>✓ Connected{st.realm_id ? ` · company ${st.realm_id}` : ""}{st.institution ? ` · ${st.institution}` : ""}{(st.env || st.environment) === "sandbox" ? " · sandbox" : ""}</Typography>
+          : <Typography variant="body2" sx={{ color: DIM }}>{st?.has_app ? "keys saved — not connected yet" : "paste the application's keys below and Save first"}</Typography>}
+      </Box>
+      {st?.redirect_uri && (
+        <Typography variant="caption" sx={{ color: FAINT, display: "block", mt: 0.75, lineHeight: 1.6 }}>
+          The Intuit app must list this redirect URI, exactly: <Box component="code" sx={{ ...mono, fontSize: 11, color: INK, bgcolor: "#fff", px: 0.6, borderRadius: 0.75, border: `1px solid ${BORDER}` }}>{st.redirect_uri}</Box>
+        </Typography>
+      )}
+      {err && <Typography variant="body2" sx={{ color: "#6b2733", mt: 0.75 }}>✗ {err}</Typography>}
+    </Box>
+  );
+}
+
 function DataDetail({ conn, meta, sources, reload, onBack, onCreated, byType = {} }) {
   const [tab, setTab] = useState("Connection");
   const [cfg, setCfg] = useState(parse(conn?.ConfigJson));
@@ -1771,6 +1864,7 @@ function DataDetail({ conn, meta, sources, reload, onBack, onCreated, byType = {
               <Button size="small" variant="outlined" disabled={!!busy} onClick={useShared}>Use it — save and test</Button>
             </Box>
           )}
+          {meta.connect && <OAuthConnect conn={conn} meta={meta} reload={reload} />}
           {meta.fields.map(([label, key, ph]) => (
             <TextField key={key} label={label} placeholder={ph} value={cfg[key] || ""} sx={{ bgcolor: "#fff" }}
               multiline={key === "conn_str"} minRows={key === "conn_str" ? 2 : undefined}

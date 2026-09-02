@@ -10,7 +10,7 @@ import { ThemeProvider, CssBaseline } from "@mui/material";
 import RefreshIcon from "@mui/icons-material/Refresh";
 import api from "./api";
 import { track } from "./demoTrack";
-import { theme, ALERT, BG, BORDER, DIM, FAINT, INK, PANEL, GRADIENT } from "./theme.jsx";
+import { theme, ACCENT, ALERT, BG, BORDER, DIM, FAINT, INK, PANEL, GRADIENT } from "./theme.jsx";
 import FeedView from "./FeedView.jsx";
 import BoardView from "./BoardView.jsx";
 const SocialView = React.lazy(() => import("./SocialView.jsx"));
@@ -22,7 +22,7 @@ import DocsView from "./DocsView.jsx";
 import SettingsView from "./SettingsView.jsx";
 import { SetupChip, SetupPanel, useSetup } from "./SetupWizard.jsx";
 import { DEMO } from "./demoApi.js";
-import { isStale, loadedAsset } from "./staleBuild.js";
+import { loadedAsset, staleWhat } from "./staleBuild.js";
 import { useHandRaise, playSound, desktopNotify } from "./handraise.js";
 import { dismissHandRaise, enqueueHandRaise, handRaiseWhat, isWatchingTask } from "./handraiseState.js";
 import { TaskuaryMark } from "./ui.jsx";
@@ -103,7 +103,7 @@ function DemoBadge({ demo }) {
   if (!demo) return null;
   return (
     <Tooltip title={`Everything here is invented${demo.owner ? ` - you are ${demo.owner}, who does not exist` : ""}: the people, the mail, the agents. Nothing sends, nothing connects, and no real system is reachable from this page.`}>
-      <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, px: 0.9, py: 0.3, borderRadius: 99,
+      <Box sx={{ display: { xs: "none", sm: "flex" }, alignItems: "center", gap: 0.5, px: 0.9, py: 0.3, borderRadius: 99,
         flexShrink: 0, border: "1px solid #d8cfbe", bgcolor: "#f1ead9" }}>
         <Box sx={{ width: 7, height: 7, borderRadius: "50%", bgcolor: "#8a7a5c" }} />
         <Typography variant="caption" noWrap sx={{ fontWeight: 700, color: "#6b5f45" }}>demo data</Typography>
@@ -113,26 +113,28 @@ function DemoBadge({ demo }) {
 }
 
 function StaleBuild() {
-  const [stale, setStale] = useState(false);
+  const [stale, setStale] = useState("");
   useEffect(() => {
     // the static demo IS a recording: its /api/build is whatever the instance it was dumped
     // from was running, which is not a newer version of anything
     if (import.meta.env.VITE_DEMO === "1") return undefined;
     const mine = loadedAsset();
     const check = () => api.get("/api/build")
-      .then(({ data }) => setStale(isStale(mine, data.asset))).catch(() => {});
+      .then(({ data }) => setStale(staleWhat(mine, data))).catch(() => {});
     check();
     const t = setInterval(check, 60000);
     return () => clearInterval(t);
   }, []);
   if (!stale) return null;
+  const restart = /restart/.test(stale);
   return (
-    <Tooltip title="Taskuary has been updated on disk since this page was opened. Nothing is lost by reloading.">
-      <Box onClick={() => window.location.reload()}
-        sx={{ display: "flex", alignItems: "center", gap: 0.6, cursor: "pointer", px: 1, py: 0.3,
+    <Tooltip title={restart ? "pyproject.toml carries a newer version than this server started with - the header, the API and the CLI all report the old one until Taskuary is restarted. Nothing is lost by restarting."
+      : "Taskuary has been updated on disk since this page was opened. Nothing is lost by reloading."}>
+      <Box onClick={() => !restart && window.location.reload()}
+        sx={{ display: "flex", alignItems: "center", gap: 0.6, cursor: restart ? "default" : "pointer", px: 1, py: 0.3,
           borderRadius: 99, border: "1px solid #d8cfbe", bgcolor: "#f1ead9" }}>
         <Box sx={{ width: 7, height: 7, borderRadius: "50%", bgcolor: "#6f8a6e" }} />
-        <Typography variant="caption" sx={{ fontWeight: 700, color: "#55697a" }}>update ready — reload</Typography>
+        <Typography variant="caption" sx={{ fontWeight: 700, color: "#55697a" }}>{stale}</Typography>
       </Box>
     </Tooltip>
   );
@@ -193,10 +195,10 @@ export default function TaskHubPage() {
   // a first run opens it once, unprompted: somebody who has just installed this should not have
   // to find the checklist. Once put away (or once required steps are done) it never opens itself.
   useEffect(() => {
-    if (DEMO || greeted || !setup || setup.ready || setup.dismissed) return;
+    if (DEMO || demo || greeted || !setup || setup.ready || setup.dismissed) return;
     if (setup.done === 0) setSetupOpen(true);
     setGreeted(true);
-  }, [setup, greeted]);
+  }, [setup, greeted, demo]);
   const dismissSetup = async (d) => {
     await api.post("/api/setup/dismiss", { dismissed: d });
     reloadSetup();
@@ -259,12 +261,14 @@ export default function TaskHubPage() {
       <CssBaseline />
       {/* textAlign left kills the CRA-default .App { text-align: center } leaking in */}
       <Box sx={{ minHeight: "100vh", bgcolor: BG, textAlign: "left" }}>
+        {/* bottom-right, not under the top bar: up there it covered the row every tab keeps its
+            actions on (the Board's buttons, a task's Mark done) for twelve seconds per hand raised */}
         <Snackbar key={raised?.eventId || "no-hand-raised"} open={!!raised} autoHideDuration={12000}
           onClose={() => setRaisedQueue(dismissHandRaise)}
-          anchorOrigin={{ vertical: "top", horizontal: "right" }}
-          sx={{ mt: 5.5 }}
+          anchorOrigin={{ vertical: "bottom", horizontal: "right" }}
+          sx={{ mb: 1 }}
           message={raised ? `${raised.ref} · ${raised.what}${raised.title ? ` — ${raised.title}` : ""}` : ""}
-          action={raised && <Button size="small" sx={{ color: "#a6e3a1" }} onClick={() => { openTask(raised.tid); setRaisedQueue(dismissHandRaise); }}>Open</Button>} />
+          action={raised && <Button size="small" sx={{ color: ACCENT, fontWeight: 700 }} onClick={() => { openTask(raised.tid); setRaisedQueue(dismissHandRaise); }}>Open</Button>} />
         {/* ── slim top bar ───────────────────────────────────────────── */}
         {/* Full width, deliberately. Constraining this to the page column squeezed the tab strip
             until its overflowX put a horizontal SCROLLBAR under the nav - a slider you have to
@@ -287,7 +291,6 @@ export default function TaskHubPage() {
           </Typography>
           <ServerVersion />
           <DemoBadge demo={demo} />
-          <StaleBuild />
 
           {/* Below 900px the full tab strip had no room: it began under the brand and its
               off-screen pages had no visible affordance. One labelled selector keeps the
@@ -337,7 +340,11 @@ export default function TaskHubPage() {
             ))}
           </Box>
           <Box sx={{ flex: 1 }} />
-          {!DEMO && <SetupChip state={setup} onOpen={() => setSetupOpen(true)} />}
+          {/* on the RIGHT, with the other transient chrome. On the left it grew the brand cluster
+              until it slid UNDER the tab strip, which is absolutely centred on the window and so
+              yields to nothing - the banner sat on top of "Timeline". */}
+          <StaleBuild />
+          {!DEMO && !demo && <SetupChip state={setup} onOpen={() => setSetupOpen(true)} />}
           {/* the Fix button lands on the card itself: Connectors reads #connector=<type> on the way in */}
           <Bell onGo={(p) => { if (p.connector) window.location.hash = `connector=${p.connector}`; go(p.where || "Connections"); }} />
           <Tooltip title="Refresh">
@@ -345,7 +352,7 @@ export default function TaskHubPage() {
           </Tooltip>
         </Box>
 
-        {!DEMO && (
+        {!DEMO && !demo && (
           <SetupPanel open={setupOpen} state={setup} onClose={() => { setSetupOpen(false); reloadSetup(); }}
             onDismiss={dismissSetup} onRefresh={reloadSetup}
             onGo={(where) => { setSetupOpen(false); go(where); }} />

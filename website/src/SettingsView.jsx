@@ -22,7 +22,7 @@ import { AgentsPage } from "./AgentsPanel.jsx";
 import AboutYou from "./AboutYou.jsx";
 import api from "./api";
 import { PANEL2, BORDER, DIM, FAINT, INK, ACCENT2, card, mono, ACTION_COLORS } from "./theme.jsx";
-import { ChannelIcon, Empty, FilterPills, TaskuaryMark } from "./ui.jsx";
+import { ChannelIcon, ConfirmDelete, Empty, FilterPills, TaskuaryMark } from "./ui.jsx";
 import { notifyState } from "./notify.js";
 
 
@@ -229,6 +229,7 @@ function SettingsPages({ page, setPage, q, setQ }) {
 
   const savePolicy = async (p) => { await api.post("/api/policies", p); setDraft(null); load(); };
   const togglePolicy = async (p) => { await api.post("/api/policies", { PolicyId: p.PolicyId, Active: !p.Active }); load(); };
+  const [delPolicy, setDelPolicy] = useState(null);      // the rule awaiting its confirm
   const deletePolicy = async (p) => { await api.delete(`/api/policies/${p.PolicyId}`); load(); };
   const saveSetting = async (name, value) => { await api.patch("/api/settings", { name, value }); load(); };
   const toggleMemory = async (m) => { await api.patch(`/api/memory/${m.MemoryId}`, { active: !m.Active }); load(); };
@@ -377,9 +378,9 @@ function SettingsPages({ page, setPage, q, setQ }) {
       <Box>
         <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 1 }}>
           <Typography variant="body2" sx={{ color: DIM }}>
-            Deterministic gates the AI can never override.
+            {/* the page title above already says what these are; this line is the door to the rules of the rules */}
             <Typography component="span" variant="body2" onClick={() => setHelp(SECTION_HELP.policies)}
-              sx={{ color: "#55697a", cursor: "pointer", ml: 0.75, "&:hover": { textDecoration: "underline" } }}>
+              sx={{ color: "#55697a", cursor: "pointer", "&:hover": { textDecoration: "underline" } }}>
               How precedence works →
             </Typography>
           </Typography>
@@ -408,9 +409,12 @@ function SettingsPages({ page, setPage, q, setQ }) {
             <Typography variant="caption" sx={{ ...mono, color: FAINT }}>#{p.SortOrder}</Typography>
             <Button size="small" onClick={() => setDraft({ ...p, Active: !!p.Active })}>Edit</Button>
             <Switch checked={!!p.Active} onChange={() => togglePolicy(p)} />
-            <IconButton size="small" title="Delete this rule" onClick={() => deletePolicy(p)}><DeleteOutlineIcon sx={{ fontSize: 16 }} /></IconButton>
+            <IconButton size="small" title="Delete this rule" onClick={() => setDelPolicy(p)}><DeleteOutlineIcon sx={{ fontSize: 16 }} /></IconButton>
           </Box>
         ))}
+        <ConfirmDelete open={!!delPolicy} what={delPolicy ? `the rule “${delPolicy.Name}”` : "this rule"}
+          consequence="Messages it matched go back to being judged by triage alone."
+          onClose={() => setDelPolicy(null)} onConfirm={() => deletePolicy(delPolicy)} />
         {draft && (
           <Box sx={{ ...card, bgcolor: PANEL2, p: 2, mt: 2, display: "flex", flexDirection: "column", gap: 1.25 }}>
             <Typography variant="body2" sx={{ color: "#55697a", fontWeight: 700 }}>{draft.PolicyId ? `Edit rule · ${draft.Name}` : "New rule"}</Typography>
@@ -585,7 +589,7 @@ export default function SettingsView() {
       gap: 3, alignItems: "start", maxWidth: 1320, mx: "auto" }}>
       <Box sx={{ position: { md: "sticky" }, top: { md: 62 } }}>
         <Typography sx={{ color: INK, fontWeight: 700, fontSize: 16, mb: 1.5 }}>Settings</Typography>
-        <TextField fullWidth placeholder="Search settings, rules, memory…" value={q}
+        <TextField fullWidth placeholder="Search settings…" value={q}
           onChange={(e) => setQ(e.target.value)} sx={{ mb: 1.5, bgcolor: "#fff", borderRadius: 2 }}
           InputProps={{ startAdornment: <InputAdornment position="start"><SearchIcon sx={{ fontSize: 17, color: FAINT }} /></InputAdornment> }} />
         {NAV.map((k) => {
@@ -606,6 +610,15 @@ export default function SettingsView() {
         </Typography>
       </Box>
       <Box sx={{ minWidth: 0 }}>
+        {/* the other rails (Reports, Connections, Docs) open every section under its title; this
+            one dropped you straight into the knobs, and the config page's sub-tabs read as the
+            heading. Same title style the Board and Reports use. */}
+        {!q && ["config", "policies", "memory", "audit"].includes(page) && (
+          <Box sx={{ mb: 2 }}>
+            <Typography sx={{ color: INK, fontWeight: 800, fontSize: 15 }}>{PAGES[page].title}</Typography>
+            <Typography variant="body2" sx={{ color: DIM, mt: 0.25 }}>{PAGES[page].desc}</Typography>
+          </Box>
+        )}
         <SettingsPages page={q ? null : page} setPage={setPage} q={q} setQ={setQ} />
       </Box>
     </Box>
