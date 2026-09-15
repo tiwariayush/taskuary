@@ -1,0 +1,14 @@
+{
+  "name": "Taskuary",
+  "install": "bash .cursor/install.sh",
+  "terminals": [
+    {
+      "name": "taskuary-demo",
+      "command": "cd /workspace && . .venv/bin/activate && exec taskuary --demo --no-browser --host 127.0.0.1 --port 7787",
+      "description": "Taskuary running in --demo mode (invented data, scripted AI, every outbound door shut) on http://127.0.0.1:7787. A real dev instance is `taskuary --debug`; it relocates to a free port if this one is taken."
+    }
+  ],
+  "ports": [
+    { "name": "taskuary web", "port": 7787 }
+  ]
+}
